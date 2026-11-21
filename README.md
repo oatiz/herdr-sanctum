@@ -1,6 +1,8 @@
 # herdr-sanctum
 
-A native Emacs multi-agent workbench UI for [Herdr](https://github.com/herdr-dev/herdr), built around a three-pane layout:
+A native Emacs multi-agent workbench UI for [Herdr](https://github.com/herdr-dev/herdr), built around a three-pane layout.
+
+![herdr-sanctum three-pane workbench in Emacs showing the Spaces and Agents sidebar, center Herdr terminal, and right Overview drawer](docs/images/workbench.png)
 
 - **Left sidebar (`*sanctum-spaces*`)**: flat Herdr spaces with inline SVG monograms, async Git branch/ahead/behind/dirty indicators, on-demand tab tree expansion, and a bottom-anchored **Agents** section grouped by `Blocked` / `Working` / `Done` / `Idle` with brand icons and elapsed durations.
 - **Center terminal (`*sanctum*`)**: hosts `herdr` through a pluggable terminal backend (shipping with `ghostel`), topped by a quiet pixel-aligned breadcrumb and action chrome bar.

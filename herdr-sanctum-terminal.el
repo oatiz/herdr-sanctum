@@ -24,9 +24,8 @@
 ;;; Commentary:
 
 ;; Terminal emulator abstraction for hosting the `herdr' TUI inside Emacs.
-;; Ships with a `ghostel' backend and allows registering custom backends
-;; (for example `eat', `vterm', or user-defined adapters) via
-;; `herdr-sanctum-register-terminal-backend'.
+;; Ships with built-in `ghostel', `vterm', and `eat' backends and allows
+;; registering custom backends via `herdr-sanctum-register-terminal-backend'.
 
 ;;; Code:
 
@@ -42,6 +41,19 @@
 (defvar ghostel-buffer-name-function)
 (defvar ghostel-detect-password-prompts)
 (defvar ghostel-window-padding-balance)
+
+(declare-function vterm-mode "vterm" ())
+(declare-function vterm--window-adjust-process-window-size "vterm" (process windows))
+(defvar vterm-copy-mode)
+(defvar vterm-kill-buffer-on-exit)
+(defvar vterm-shell)
+
+(declare-function eat-mode "eat" ())
+(declare-function eat-exec "eat" (buffer name command startfile switches))
+(declare-function eat--adjust-process-window-size "eat" (process windows))
+(defvar eat--char-mode)
+(defvar eat--semi-char-mode)
+(defvar eat-kill-buffer-on-exit)
 
 (defgroup herdr-sanctum-terminal nil
   "Terminal emulator backend settings for `herdr-sanctum'."
@@ -68,7 +80,10 @@ or a backend plist directly with keys:
   `:setup'        -- `(BUFFER)' optional buffer-local tweaks after start
   `:mode-banner'  -- `(BUFFER)' optional header-line banner override string
   `:available-p'  -- `()' optional check used by `herdr-sanctum-doctor'."
-  :type '(choice (symbol :tag "Registered backend")
+  :type '(choice (const :tag "Ghostel" ghostel)
+                 (const :tag "vterm" vterm)
+                 (const :tag "Eat" eat)
+                 (symbol :tag "Custom registered backend")
                  (plist :tag "Custom backend plist"))
   :group 'herdr-sanctum-terminal)
 
@@ -95,8 +110,31 @@ When nil, keep the active terminal mode's default height."
                         (herdr-sanctum-terminal-live-p buf))
                (herdr-sanctum-terminal-resize))))))
 
-(defvar herdr-sanctum-terminal-start-hook nil
-  "Hook run inside `*sanctum*' after `herdr-sanctum-terminal-start' finishes.")
+(defcustom herdr-sanctum-terminal-mode-line-format nil
+  "Buffer-local `mode-line-format' applied to the `*sanctum*' terminal buffer.
+When nil, hide the mode-line in `*sanctum*'.  When `default', use Emacs's
+default `mode-line-format'.  Any other value is used directly as a custom
+`mode-line-format' specification."
+  :type '(choice (const :tag "Hidden" nil)
+                 (const :tag "Use default mode-line" default)
+                 (sexp :tag "Custom mode-line-format"))
+  :group 'herdr-sanctum-terminal
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (and (featurep 'herdr-sanctum-terminal)
+                    (fboundp 'herdr-sanctum-terminal--apply-mode-line-format))
+           (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
+             (herdr-sanctum-terminal--apply-mode-line-format buf)
+             (force-mode-line-update t)
+             (when (and (fboundp 'herdr-sanctum-terminal-live-p)
+                        (fboundp 'herdr-sanctum-terminal-resize)
+                        (herdr-sanctum-terminal-live-p buf))
+               (herdr-sanctum-terminal-resize))))))
+
+(defcustom herdr-sanctum-terminal-start-hook nil
+  "Hook run inside `*sanctum*' after `herdr-sanctum-terminal-start' finishes."
+  :type 'hook
+  :group 'herdr-sanctum-terminal)
 
 (defvar-local herdr-sanctum-terminal--font-cookie nil
   "Face-remapping cookie for `herdr-sanctum-terminal-font-height'.")
@@ -116,6 +154,18 @@ preserved when `herdr-sanctum-terminal-font-height' is nil or reset."
         (setq herdr-sanctum-terminal--font-cookie
               (face-remap-add-relative 'default
                                        :height herdr-sanctum-terminal-font-height))))))
+
+(defun herdr-sanctum-terminal--apply-mode-line-format (buffer)
+  "Synchronize `mode-line-format' in terminal BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (cond
+       ((null herdr-sanctum-terminal-mode-line-format)
+        (setq-local mode-line-format nil))
+       ((eq herdr-sanctum-terminal-mode-line-format 'default)
+        (kill-local-variable 'mode-line-format))
+       (t
+        (setq-local mode-line-format herdr-sanctum-terminal-mode-line-format))))))
 
 (defvar herdr-sanctum-terminal-backends nil
   "Alist of `(NAME . PLIST)' registered Sanctum terminal backends.")
@@ -213,6 +263,7 @@ Optional RESOLVED is a `(BACKEND . PROGRAM)' cons returned by
       (with-current-buffer buffer
         (setq-local line-spacing herdr-sanctum-terminal-line-spacing)
         (herdr-sanctum-terminal--apply-font-height buffer)
+        (herdr-sanctum-terminal--apply-mode-line-format buffer)
         (run-hooks 'herdr-sanctum-terminal-start-hook)))
     buffer))
 
@@ -269,20 +320,75 @@ Returns nil gracefully when the terminal backend is invalid or unconfigured."
   (when (fboundp 'ghostel--adjust-size)
     (ghostel--adjust-size window t)))
 
-(defconst herdr-sanctum-ghostel--banner-copy
-  (propertize " COPY  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
-              'face 'herdr-sanctum-banner-info)
+(defun herdr-sanctum-terminal--make-banner (text face)
+  "Build a full-width pre-allocated header-line banner for TEXT and FACE."
+  (concat (propertize text 'face face)
+          (propertize " " 'display '(space :align-to right) 'face face)))
+
+(defalias 'herdr-sanctum-ghostel--make-banner
+  #'herdr-sanctum-terminal--make-banner)
+
+(defun herdr-sanctum-ghostel--set-banner-text (sym val)
+  "Set Ghostel banner text option SYM to VAL and rebuild cached banners."
+  (set-default sym val)
+  (when (and (featurep 'herdr-sanctum-terminal)
+             (fboundp 'herdr-sanctum-ghostel--rebuild-banners))
+    (herdr-sanctum-ghostel--rebuild-banners)
+    (force-mode-line-update t)))
+
+(defcustom herdr-sanctum-ghostel-banner-copy-text
+  " COPY  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
+  "Header-line banner text shown during Ghostel `copy' input mode."
+  :type 'string
+  :group 'herdr-sanctum-terminal
+  :set #'herdr-sanctum-ghostel--set-banner-text)
+
+(defcustom herdr-sanctum-ghostel-banner-emacs-text
+  " EMACS (live)  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
+  "Header-line banner text shown during Ghostel `emacs' input mode."
+  :type 'string
+  :group 'herdr-sanctum-terminal
+  :set #'herdr-sanctum-ghostel--set-banner-text)
+
+(defcustom herdr-sanctum-ghostel-banner-char-text
+  " CHAR (raw keys)  M-RET exit "
+  "Header-line banner text shown during Ghostel `char' input mode."
+  :type 'string
+  :group 'herdr-sanctum-terminal
+  :set #'herdr-sanctum-ghostel--set-banner-text)
+
+(defvar herdr-sanctum-ghostel--banner-copy
+  (herdr-sanctum-terminal--make-banner
+   herdr-sanctum-ghostel-banner-copy-text
+   'herdr-sanctum-banner-info)
   "Pre-allocated header-line banner for Ghostel `copy' input mode.")
 
-(defconst herdr-sanctum-ghostel--banner-emacs
-  (propertize " EMACS (live)  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
-              'face 'herdr-sanctum-banner-info)
+(defvar herdr-sanctum-ghostel--banner-emacs
+  (herdr-sanctum-terminal--make-banner
+   herdr-sanctum-ghostel-banner-emacs-text
+   'herdr-sanctum-banner-info)
   "Pre-allocated header-line banner for Ghostel `emacs' input mode.")
 
-(defconst herdr-sanctum-ghostel--banner-char
-  (propertize " CHAR (raw keys)  M-RET exit "
-              'face 'herdr-sanctum-banner-warn)
+(defvar herdr-sanctum-ghostel--banner-char
+  (herdr-sanctum-terminal--make-banner
+   herdr-sanctum-ghostel-banner-char-text
+   'herdr-sanctum-banner-warn)
   "Pre-allocated header-line banner for Ghostel `char' input mode.")
+
+(defun herdr-sanctum-ghostel--rebuild-banners ()
+  "Rebuild pre-allocated Ghostel header-line banners from custom texts."
+  (setq herdr-sanctum-ghostel--banner-copy
+        (herdr-sanctum-terminal--make-banner
+         herdr-sanctum-ghostel-banner-copy-text
+         'herdr-sanctum-banner-info)
+        herdr-sanctum-ghostel--banner-emacs
+        (herdr-sanctum-terminal--make-banner
+         herdr-sanctum-ghostel-banner-emacs-text
+         'herdr-sanctum-banner-info)
+        herdr-sanctum-ghostel--banner-char
+        (herdr-sanctum-terminal--make-banner
+         herdr-sanctum-ghostel-banner-char-text
+         'herdr-sanctum-banner-warn)))
 
 (defun herdr-sanctum-ghostel--mode-banner (buffer)
   "Return a header-line banner for non-semi-char Ghostel modes in BUFFER."
@@ -301,6 +407,136 @@ Returns nil gracefully when the terminal backend is invalid or unconfigured."
  :resize #'herdr-sanctum-ghostel--resize
  :mode-banner #'herdr-sanctum-ghostel--mode-banner
  :available-p (lambda () (or (featurep 'ghostel) (locate-library "ghostel"))))
+
+;;; Built-in vterm Backend
+
+(defun herdr-sanctum-vterm--start (buffer program args)
+  "Start PROGRAM with ARGS in BUFFER using `vterm'."
+  (unless (require 'vterm nil t)
+    (user-error "The `vterm' package is required for the vterm terminal backend"))
+  (let ((vterm-shell (mapconcat #'shell-quote-argument (cons program args) " "))
+        (vterm-kill-buffer-on-exit nil))
+    (with-current-buffer buffer
+      (vterm-mode))))
+
+(defun herdr-sanctum-vterm--live-p (buffer)
+  "Return non-nil when BUFFER is a live `vterm-mode' terminal."
+  (with-current-buffer buffer
+    (and (derived-mode-p 'vterm-mode)
+         (let ((proc (get-buffer-process buffer)))
+           (and proc (process-live-p proc))))))
+
+(defun herdr-sanctum-vterm--setup (buffer)
+  "Apply `vterm'-specific buffer-local tuning for Herdr in BUFFER."
+  (with-current-buffer buffer
+    (setq-local vterm-kill-buffer-on-exit nil)))
+
+(defun herdr-sanctum-vterm--resize (window)
+  "Force `vterm' to recalculate PTY size for WINDOW."
+  (when-let* ((buf (window-buffer window))
+              (proc (get-buffer-process buf))
+              ((process-live-p proc))
+              ((fboundp 'vterm--window-adjust-process-window-size)))
+    (ignore-errors
+      (with-current-buffer buf
+        (when-let* ((size (vterm--window-adjust-process-window-size
+                           proc (list window)))
+                    ((consp size))
+                    ((integerp (car size)))
+                    ((integerp (cdr size))))
+          (set-process-window-size proc (cdr size) (car size)))))))
+
+(defvar herdr-sanctum-vterm--banner-copy
+  (herdr-sanctum-terminal--make-banner
+   " COPY  RET copy · C-c C-t exit "
+   'herdr-sanctum-banner-info)
+  "Pre-allocated header-line banner for `vterm-copy-mode'.")
+
+(defun herdr-sanctum-vterm--mode-banner (buffer)
+  "Return a header-line banner when `vterm-copy-mode' is active in BUFFER."
+  (with-current-buffer buffer
+    (when (bound-and-true-p vterm-copy-mode)
+      herdr-sanctum-vterm--banner-copy)))
+
+(herdr-sanctum-register-terminal-backend
+ 'vterm
+ :start #'herdr-sanctum-vterm--start
+ :live-p #'herdr-sanctum-vterm--live-p
+ :setup #'herdr-sanctum-vterm--setup
+ :resize #'herdr-sanctum-vterm--resize
+ :mode-banner #'herdr-sanctum-vterm--mode-banner
+ :available-p (lambda () (or (featurep 'vterm) (locate-library "vterm"))))
+
+;;; Built-in Eat Backend
+
+(defun herdr-sanctum-eat--start (buffer program args)
+  "Start PROGRAM with ARGS in BUFFER using `eat'."
+  (unless (require 'eat nil t)
+    (user-error "The `eat' package is required for the eat terminal backend"))
+  (with-current-buffer buffer
+    (unless (derived-mode-p 'eat-mode)
+      (eat-mode))
+    (eat-exec buffer "sanctum" program nil args)))
+
+(defun herdr-sanctum-eat--live-p (buffer)
+  "Return non-nil when BUFFER is a live `eat-mode' terminal."
+  (with-current-buffer buffer
+    (and (derived-mode-p 'eat-mode)
+         (let ((proc (get-buffer-process buffer)))
+           (and proc (process-live-p proc))))))
+
+(defun herdr-sanctum-eat--setup (buffer)
+  "Apply `eat'-specific buffer-local tuning for Herdr in BUFFER."
+  (with-current-buffer buffer
+    (setq-local eat-kill-buffer-on-exit nil)))
+
+(defun herdr-sanctum-eat--resize (window)
+  "Force `eat' to recalculate PTY size for WINDOW."
+  (when-let* ((buf (window-buffer window))
+              (proc (get-buffer-process buf))
+              ((process-live-p proc))
+              ((fboundp 'eat--adjust-process-window-size)))
+    (ignore-errors
+      (with-current-buffer buf
+        (when-let* ((size (eat--adjust-process-window-size proc (list window)))
+                    ((consp size))
+                    ((integerp (car size)))
+                    ((integerp (cdr size))))
+          (set-process-window-size proc (cdr size) (car size)))))))
+
+(defvar herdr-sanctum-eat--banner-emacs
+  (herdr-sanctum-terminal--make-banner
+   " EMACS  C-c C-j exit "
+   'herdr-sanctum-banner-info)
+  "Pre-allocated header-line banner for `eat' emacs input mode.")
+
+(defvar herdr-sanctum-eat--banner-char
+  (herdr-sanctum-terminal--make-banner
+   " CHAR (raw keys)  M-RET exit "
+   'herdr-sanctum-banner-warn)
+  "Pre-allocated header-line banner for `eat' char input mode.")
+
+(defun herdr-sanctum-eat--mode-banner (buffer)
+  "Return a header-line banner for non-semi-char `eat' input modes in BUFFER."
+  (with-current-buffer buffer
+    (cond
+     ((bound-and-true-p eat--char-mode)
+      herdr-sanctum-eat--banner-char)
+     ((bound-and-true-p eat--semi-char-mode)
+      nil)
+     ((or (derived-mode-p 'eat-mode)
+          (local-variable-p 'eat--semi-char-mode)
+          (local-variable-p 'eat--char-mode))
+      herdr-sanctum-eat--banner-emacs))))
+
+(herdr-sanctum-register-terminal-backend
+ 'eat
+ :start #'herdr-sanctum-eat--start
+ :live-p #'herdr-sanctum-eat--live-p
+ :setup #'herdr-sanctum-eat--setup
+ :resize #'herdr-sanctum-eat--resize
+ :mode-banner #'herdr-sanctum-eat--mode-banner
+ :available-p (lambda () (or (featurep 'eat) (locate-library "eat"))))
 
 (provide 'herdr-sanctum-terminal)
 ;;; herdr-sanctum-terminal.el ends here

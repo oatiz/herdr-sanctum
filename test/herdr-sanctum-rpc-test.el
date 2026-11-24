@@ -51,7 +51,13 @@
                        "{\"event\":\"workspace.renamed\",\"data\":{\"type\":\"workspace_renamed\",\"label\":\"subscription_started\"}}")
                       'schedule))
           (should (equal (caar events) "workspace_renamed"))
-          ;; Tab and workspace focus trigger immediate snapshot.
+          ;; Pane, tab, and workspace focus trigger immediate snapshot.
+          (should (eq (herdr-sanctum--handle-event-line
+                       "{\"event\":\"pane.focused\",\"data\":{\"type\":\"pane_focused\",\"pane_id\":\"w1:p2\"}}")
+                      'immediate))
+          (should (eq (herdr-sanctum--handle-event-line
+                       "{\"event\":\"pane.focused\",\"data\":{\"pane_id\":\"w1:p3\"}}")
+                      'immediate))
           (should (eq (herdr-sanctum--handle-event-line
                        "{\"event\":\"tab.focused\",\"data\":{\"type\":\"tab_focused\",\"tab_id\":\"w1:t2\"}}")
                       'immediate))
@@ -790,5 +796,408 @@
           (should-not (herdr-sanctum-connected-p))
           (should-not (timerp herdr-sanctum--duration-timer)))))))
 
+(ert-deftest herdr-sanctum-rpc-test/reconnect-cold-start-ramp ()
+  "Cold-start reconnect ramps delays, caps at interval, and resets on ack."
+  (herdr-sanctum-test-with-clean-state
+    (get-buffer-create herdr-sanctum-buffer-name)
+    ;; 1. Default steady-state interval ramps (0.2 0.5 1.0 5.0 5.0).
+    (let ((delays nil)
+          (herdr-sanctum-reconnect-interval 5.0))
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (secs _rep _fn &rest _args)
+                   (push secs delays)
+                   'fake-timer)))
+        (dotimes (_ 5)
+          (setq herdr-sanctum--reconnect-timer nil)
+          (herdr-sanctum--schedule-reconnect))
+        (setq herdr-sanctum--reconnect-timer nil))
+      (should (equal (nreverse delays) '(0.2 0.5 1.0 5.0 5.0)))
+      (should (= herdr-sanctum--reconnect-attempt 5)))
+    ;; 2. Explicit delay does not perturb cold-start ramp counter.
+    (let ((delays nil))
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (secs _rep _fn &rest _args)
+                   (push secs delays)
+                   'fake-timer)))
+        (setq herdr-sanctum--reconnect-timer nil)
+        (herdr-sanctum--schedule-reconnect 0.25)
+        (setq herdr-sanctum--reconnect-timer nil))
+      (should (equal delays '(0.25)))
+      (should (= herdr-sanctum--reconnect-attempt 5)))
+    ;; 3. Disconnect resets attempt counter; smaller interval caps ramp steps.
+    (herdr-sanctum-disconnect)
+    (should (= herdr-sanctum--reconnect-attempt 0))
+    (get-buffer-create herdr-sanctum-buffer-name)
+    (let ((delays nil)
+          (herdr-sanctum-reconnect-interval 0.3))
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (secs _rep _fn &rest _args)
+                   (push secs delays)
+                   'fake-timer)))
+        (dotimes (_ 3)
+          (setq herdr-sanctum--reconnect-timer nil)
+          (herdr-sanctum--schedule-reconnect))
+        (setq herdr-sanctum--reconnect-timer nil))
+      (should (equal (nreverse delays) '(0.2 0.3 0.3)))
+      (should (= herdr-sanctum--reconnect-attempt 3)))
+    ;; 4. Successful subscription ack resets attempt counter back to 0.
+    (herdr-sanctum-test-with-mock-server (_sock)
+        (lambda (client data)
+          (dolist (req (herdr-sanctum-test--parse-json-lines data))
+            (let ((id (alist-get 'id req))
+                  (method (alist-get 'method req)))
+              (cond
+               ((equal method "events.subscribe")
+                (herdr-sanctum-test--send-json
+                 client `((id . ,id) (result . ((type . "subscription_started"))))))
+               ((equal method "session.snapshot")
+                (herdr-sanctum-test--send-json
+                 client `((id . ,id)
+                          (result . ((type . "session_snapshot")
+                                     (snapshot . ((focused_workspace_id . "w1"))))))))))))
+      (herdr-sanctum-ensure-connected)
+      (should (herdr-sanctum-test--wait-until
+               (lambda ()
+                 (and (numberp herdr-sanctum--sub-ack-time)
+                      (= herdr-sanctum--reconnect-attempt 0)))
+               1.5)))))
+
+(ert-deftest herdr-sanctum-rpc-test/real-disconnect-clears-stale-snapshot ()
+  "Real disconnect clears stale snapshot and badges without killing panels."
+  (herdr-sanctum-test-with-clean-state
+    (let* ((term-buf (get-buffer-create herdr-sanctum-buffer-name))
+           (sidebar-buf (get-buffer-create herdr-sanctum-sidebar-buffer-name))
+           (drawer-buf (get-buffer-create herdr-sanctum-drawer-buffer-name))
+           (hook-snaps nil)
+           (snap-hook (lambda (s) (push s hook-snaps)))
+           (make-server
+            (lambda (sock-path clients-cell)
+              (make-network-process
+               :name (format "herdr-disc-srv-%d" (cl-incf herdr-sanctum-test--seq))
+               :server t
+               :family 'local
+               :service sock-path
+               :coding 'utf-8-unix
+               :noquery t
+               :log (lambda (_srv c _msg) (when (processp c) (push c (car clients-cell))))
+               :filter (lambda (client data)
+                         (unless (memq client (car clients-cell))
+                           (push client (car clients-cell)))
+                         (dolist (req (herdr-sanctum-test--parse-json-lines data))
+                           (let ((id (alist-get 'id req))
+                                 (method (alist-get 'method req)))
+                             (cond
+                              ((equal method "events.subscribe")
+                               (herdr-sanctum-test--send-json
+                                client `((id . ,id)
+                                         (result . ((type . "subscription_started"))))))
+                              ((equal method "session.snapshot")
+                               (herdr-sanctum-test--send-json
+                                client
+                                `((id . ,id)
+                                  (result
+                                   . ((type . "session_snapshot")
+                                      (snapshot
+                                       . ((focused_workspace_id . "w1")
+                                          (focused_tab_id . "w1:t1")
+                                          (focused_pane_id . "w1:p1")
+                                          (workspaces . [((workspace_id . "w1")
+                                                          (label . "alpha"))])
+                                          (tabs . [((tab_id . "w1:t1")
+                                                    (workspace_id . "w1")
+                                                    (label . "work"))])
+                                          (panes . [((pane_id . "w1:p1")
+                                                     (workspace_id . "w1")
+                                                     (tab_id . "w1:t1"))])
+                                          (agents . [((pane_id . "w1:p1")
+                                                      (workspace_id . "w1")
+                                                      (tab_id . "w1:t1")
+                                                      (agent . "pi")
+                                                      (agent_status . "blocked")
+                                                      (state_change_seq . 1))]))))))))))))))))
+      (unwind-protect
+          (progn
+            (add-hook 'herdr-sanctum-snapshot-hook snap-hook)
+            ;; 1. Clean Herdr exit: socket unlinked + client closed -> immediate clear.
+            (let* ((sock (expand-file-name
+                          (format "disc-rm-%d.sock" (cl-incf herdr-sanctum-test--seq))
+                          herdr-sanctum-test--root))
+                   (clients (list nil))
+                   (srv (funcall make-server sock clients))
+                   (herdr-sanctum-socket-path sock))
+              (unwind-protect
+                  (progn
+                    (herdr-sanctum-ensure-connected)
+                    (should (herdr-sanctum-test--wait-until
+                             (lambda ()
+                               (and (herdr-sanctum-snapshot)
+                                    (numberp herdr-sanctum--sub-ack-time)
+                                    herdr-sanctum--mode-line-string))
+                             1.5))
+                    (should herdr-sanctum--last-focus-key)
+                    (should (> (hash-table-count herdr-sanctum--agent-timestamps) 0))
+                    (setq hook-snaps nil)
+                    ;; Stop server and unlink socket file.
+                    (dolist (c (car clients))
+                      (when (process-live-p c) (delete-process c)))
+                    (when (process-live-p srv) (delete-process srv))
+                    (when (file-exists-p sock) (delete-file sock))
+                    (should (herdr-sanctum-test--wait-until
+                             (lambda () (null (herdr-sanctum-snapshot)))
+                             1.5))
+                    (should-not herdr-sanctum--last-focus-key)
+                    (should (= (hash-table-count herdr-sanctum--agent-timestamps) 0))
+                    (should-not herdr-sanctum--mode-line-string)
+                    (should-not herdr-sanctum--header-badge-string)
+                    (should (equal hook-snaps '(nil)))
+                    ;; Open panel buffers stay alive so onboarding cards remain visible.
+                    (should (buffer-live-p term-buf))
+                    (should (buffer-live-p sidebar-buf))
+                    (should (buffer-live-p drawer-buf)))
+                (dolist (c (car clients))
+                  (when (process-live-p c) (delete-process c)))
+                (when (process-live-p srv) (delete-process srv))
+                (when (file-exists-p sock) (ignore-errors (delete-file sock)))))
+            ;; 2. Stale socket file left after crash: 0.2s reconnect fails (ECONNREFUSED) -> clears.
+            (let* ((sock (expand-file-name
+                          (format "disc-stale-%d.sock" (cl-incf herdr-sanctum-test--seq))
+                          herdr-sanctum-test--root))
+                   (clients (list nil))
+                   (srv (funcall make-server sock clients))
+                   (herdr-sanctum-socket-path sock))
+              (unwind-protect
+                  (progn
+                    (herdr-sanctum-ensure-connected)
+                    (should (herdr-sanctum-test--wait-until
+                             (lambda ()
+                               (and (herdr-sanctum-snapshot)
+                                    (numberp herdr-sanctum--sub-ack-time)
+                                    herdr-sanctum--mode-line-string))
+                             1.5))
+                    (setq hook-snaps nil)
+                    ;; Stop server & close clients, intentionally leaving stale socket on disk.
+                    (dolist (c (car clients))
+                      (when (process-live-p c) (delete-process c)))
+                    (when (process-live-p srv) (delete-process srv))
+                    (should (file-exists-p sock))
+                    (should (herdr-sanctum-test--wait-until
+                             (lambda () (null (herdr-sanctum-snapshot)))
+                             1.5))
+                    (should-not herdr-sanctum--last-focus-key)
+                    (should (= (hash-table-count herdr-sanctum--agent-timestamps) 0))
+                    (should-not herdr-sanctum--mode-line-string)
+                    (should-not herdr-sanctum--header-badge-string)
+                    (should (equal hook-snaps '(nil)))
+                    (should (buffer-live-p term-buf))
+                    (should (buffer-live-p sidebar-buf))
+                    (should (buffer-live-p drawer-buf)))
+                (dolist (c (car clients))
+                  (when (process-live-p c) (delete-process c)))
+                (when (process-live-p srv) (delete-process srv))
+                (when (file-exists-p sock) (ignore-errors (delete-file sock))))))
+        (remove-hook 'herdr-sanctum-snapshot-hook snap-hook)))))
+
+(ert-deftest herdr-sanctum-rpc-test/socket-path-switch-reconnect ()
+  "Switching socket path closes old subscription and reconnects cleanly."
+  (herdr-sanctum-test-with-clean-state
+    (let* ((status-changes nil)
+           (focus-events nil)
+           (status-hook (lambda (agent old new)
+                          (push (list (alist-get 'pane_id agent) old new) status-changes)))
+           (focus-hook (lambda (_dir pane ws _tab)
+                         (push (list pane ws) focus-events)))
+           (make-handler
+            (lambda (ws-id status)
+              (lambda (client data)
+                (dolist (req (herdr-sanctum-test--parse-json-lines data))
+                  (let ((id (alist-get 'id req))
+                        (method (alist-get 'method req)))
+                    (cond
+                     ((equal method "events.subscribe")
+                      (herdr-sanctum-test--send-json
+                       client `((id . ,id) (result . ((type . "subscription_started"))))))
+                     ((equal method "session.snapshot")
+                      (herdr-sanctum-test--send-json
+                       client
+                       `((id . ,id)
+                         (result . ((type . "session_snapshot")
+                                    (snapshot
+                                     . ((focused_workspace_id . ,ws-id)
+                                        (focused_tab_id . "t1")
+                                        (focused_pane_id . "p1")
+                                        (agents . [((pane_id . "p1")
+                                                    (terminal_id . "term1")
+                                                    (agent . "pi")
+                                                    (agent_status . ,status)
+                                                    (state_change_seq . 1))])))))))))))))))
+      (unwind-protect
+          (progn
+            (add-hook 'herdr-sanctum-agent-status-change-hook status-hook)
+            (add-hook 'herdr-sanctum-focus-change-hook focus-hook)
+            (get-buffer-create herdr-sanctum-buffer-name)
+            (herdr-sanctum-test-with-mock-server (sock-a)
+                (funcall make-handler "ws-a" "working")
+              (herdr-sanctum-test-with-mock-server (sock-b)
+                  (funcall make-handler "ws-b" "blocked")
+                ;; 1. Connect to sock-a.
+                (let ((herdr-sanctum-socket-path sock-a))
+                  (herdr-sanctum-ensure-connected)
+                  (should (herdr-sanctum-test--wait-until
+                           (lambda ()
+                             (equal (alist-get 'focused_workspace_id (herdr-sanctum-snapshot))
+                                    "ws-a"))
+                           1.5))
+                  (should (equal herdr-sanctum--connected-socket-path sock-a))
+                  (should (equal (process-get herdr-sanctum--sub-process
+                                              'herdr-sanctum-socket-path)
+                                 sock-a)))
+                ;; 2. Switch to sock-b via `herdr-sanctum-ensure-connected'.
+                (let ((old-proc herdr-sanctum--sub-process)
+                      (herdr-sanctum-socket-path sock-b))
+                  (setq status-changes nil
+                        focus-events nil)
+                  (herdr-sanctum-ensure-connected)
+                  (should-not (process-live-p old-proc))
+                  (should (herdr-sanctum-connected-p))
+                  (should (equal herdr-sanctum--connected-socket-path sock-b))
+                  (should (equal (process-get herdr-sanctum--sub-process
+                                              'herdr-sanctum-socket-path)
+                                 sock-b))
+                  (should (herdr-sanctum-test--wait-until
+                           (lambda ()
+                             (equal (alist-get 'focused_workspace_id (herdr-sanctum-snapshot))
+                                    "ws-b"))
+                           1.5))
+                  ;; Timestamps were reset on switch so no spurious status diff fired.
+                  (should (null status-changes))
+                  (should (equal focus-events '(("p1" "ws-b")))))
+                ;; 3. Switch back to sock-a via `herdr-sanctum-refresh-state'.
+                (let ((old-proc herdr-sanctum--sub-process)
+                      (herdr-sanctum-socket-path sock-a))
+                  (herdr-sanctum-refresh-state)
+                  (should-not (process-live-p old-proc))
+                  (should (equal herdr-sanctum--connected-socket-path sock-a))
+                  (should (equal (process-get herdr-sanctum--sub-process
+                                              'herdr-sanctum-socket-path)
+                                 sock-a))
+                  (should (herdr-sanctum-test--wait-until
+                           (lambda ()
+                             (equal (alist-get 'focused_workspace_id (herdr-sanctum-snapshot))
+                                    "ws-a"))
+                           1.5))))))
+        (remove-hook 'herdr-sanctum-agent-status-change-hook status-hook)
+        (remove-hook 'herdr-sanctum-focus-change-hook focus-hook)))))
+
+(ert-deftest herdr-sanctum-rpc-test/disconnect-interactive ()
+  "`herdr-sanctum-disconnect' is interactive and clears active socket state."
+  (herdr-sanctum-test-with-clean-state
+    (should (commandp #'herdr-sanctum-disconnect))
+    (herdr-sanctum-test-with-mock-server (sock)
+        (lambda (client data)
+          (dolist (req (herdr-sanctum-test--parse-json-lines data))
+            (let ((id (alist-get 'id req))
+                  (method (alist-get 'method req)))
+              (cond
+               ((equal method "events.subscribe")
+                (herdr-sanctum-test--send-json
+                 client `((id . ,id) (result . ((type . "subscription_started"))))))
+               ((equal method "session.snapshot")
+                (herdr-sanctum-test--send-json
+                 client `((id . ,id)
+                          (result . ((type . "session_snapshot")
+                                     (snapshot . ((focused_workspace_id . "w1"))))))))))))
+      (get-buffer-create herdr-sanctum-buffer-name)
+      (herdr-sanctum-ensure-connected)
+      (should (herdr-sanctum-test--wait-until #'herdr-sanctum-snapshot 1.5))
+      (should (equal herdr-sanctum--connected-socket-path sock))
+      (setq herdr-sanctum--reconnect-attempt 2)
+      (call-interactively #'herdr-sanctum-disconnect)
+      (should-not (herdr-sanctum-connected-p))
+      (should-not herdr-sanctum--connected-socket-path)
+      (should (= herdr-sanctum--reconnect-attempt 0))
+      (should-not (herdr-sanctum-snapshot))
+      (should-not (timerp herdr-sanctum--duration-timer)))))
+
+(ert-deftest herdr-sanctum-rpc-test/agent-display-info ()
+  "`herdr-sanctum-agent-display-info' resolves workspace, tab, topic, and dir."
+  (herdr-sanctum-test-with-clean-state
+    (herdr-sanctum-test-with-temp-dir dir-a
+      (herdr-sanctum-test-with-temp-dir dir-b
+        (let* ((norm-a (file-name-as-directory (expand-file-name dir-a)))
+               (norm-b (file-name-as-directory (expand-file-name dir-b)))
+               (agent-full '((pane_id . "w1:p1")
+                             (workspace_id . "w1")
+                             (tab_id . "w1:t1")
+                             (agent . "pi")
+                             (agent_status . "blocked")
+                             (tokens . ((topic . "  oauth-pkce  ")))))
+               (agent-fallback '((pane_id . "w2:p2")
+                                 (agent_status . "working")
+                                 (tokens . ((topic . "   ")))))
+               (snap (herdr-sanctum-test-make-snapshot
+                      :workspaces '(((workspace_id . "w1") (label . "acme-api")
+                                     (active_tab_id . "w1:t1"))
+                                    ((workspace_id . "w2") (label . "")
+                                     (active_tab_id . "w2:t1")))
+                      :tabs '(((tab_id . "w1:t1") (workspace_id . "w1") (label . "auth"))
+                              ((tab_id . "w2:t1") (workspace_id . "w2") (label . "")))
+                      :panes `(((pane_id . "w1:p1") (workspace_id . "w1") (tab_id . "w1:t1")
+                                (foreground_cwd . ,dir-a) (cwd . ,dir-b))
+                               ((pane_id . "w2:p1") (workspace_id . "w2") (tab_id . "w2:t1")
+                                (cwd . ,dir-b))
+                               ((pane_id . "w2:p2") (workspace_id . "w2") (tab_id . "w2:t1")
+                                (display_agent . "Claude")))
+                      :agents (list agent-full agent-fallback)))
+               (info-full (herdr-sanctum-agent-display-info agent-full snap))
+               (info-fallback (herdr-sanctum-agent-display-info agent-fallback snap)))
+          (should (equal info-full
+                         (list :pane-id "w1:p1"
+                               :workspace-id "w1"
+                               :workspace-label "acme-api"
+                               :tab-id "w1:t1"
+                               :tab-label "auth"
+                               :agent "pi"
+                               :status "blocked"
+                               :topic "oauth-pkce"
+                               :dir norm-a)))
+          ;; Resolves workspace/tab/agent from pane, falls back labels to IDs,
+          ;; trims blank topic to nil, and falls back dir to workspace dir.
+          (should (equal info-fallback
+                         (list :pane-id "w2:p2"
+                               :workspace-id "w2"
+                               :workspace-label "w2"
+                               :tab-id "w2:t1"
+                               :tab-label "w2:t1"
+                               :agent "Claude"
+                               :status "working"
+                               :topic nil
+                               :dir norm-b)))
+          ;; Uses current snapshot automatically inside `agent-status-change-hook'.
+          (let* ((hook-info nil)
+                 (hook (lambda (agent _old _new)
+                         (setq hook-info (herdr-sanctum-agent-display-info agent)))))
+            (unwind-protect
+                (progn
+                  (add-hook 'herdr-sanctum-agent-status-change-hook hook)
+                  (herdr-sanctum-apply-snapshot snap)
+                  (herdr-sanctum-apply-snapshot
+                   (herdr-sanctum-test-make-snapshot
+                    :workspaces (alist-get 'workspaces snap)
+                    :tabs (alist-get 'tabs snap)
+                    :panes (alist-get 'panes snap)
+                    :agents '(((pane_id . "w1:p1")
+                               (workspace_id . "w1")
+                               (tab_id . "w1:t1")
+                               (agent . "pi")
+                               (agent_status . "done")
+                               (state_change_seq . 2)
+                               (tokens . ((topic . "oauth-pkce")))))))
+                  (should (equal (plist-get hook-info :workspace-label) "acme-api"))
+                  (should (equal (plist-get hook-info :tab-label) "auth"))
+                  (should (equal (plist-get hook-info :status) "done"))
+                  (should (equal (plist-get hook-info :dir) norm-a)))
+              (remove-hook 'herdr-sanctum-agent-status-change-hook hook))))))))
+
+(provide 'herdr-sanctum-rpc-test)
 (provide 'herdr-sanctum-rpc-test)
 ;;; herdr-sanctum-rpc-test.el ends here

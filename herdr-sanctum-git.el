@@ -39,6 +39,60 @@
   :group 'herdr-sanctum
   :prefix "herdr-sanctum-git-")
 
+(defvar herdr-sanctum-git--executable nil
+  "Cached path to the `git' executable, or nil before a successful lookup.")
+
+(defvar herdr-sanctum-git--executable-program nil
+  "Program name that populated `herdr-sanctum-git--executable'.")
+
+(defcustom herdr-sanctum-git-enable t
+  "When non-nil, asynchronously poll Git status and diffstat metadata."
+  :type 'boolean
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-program "git"
+  "Name or path of the `git' executable used for async polling."
+  :type 'string
+  :set (lambda (sym val)
+         (set-default sym val)
+         (setq herdr-sanctum-git--executable nil
+               herdr-sanctum-git--executable-program nil))
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-skip-remote t
+  "When non-nil, skip remote (`file-remote-p') directories cleanly."
+  :type 'boolean
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-exclude-dirs nil
+  "Directories excluded from async Git polling.
+Each element may be:
+- a directory prefix string (matches that directory and any subdirectory),
+- a cons cell `(regexp . PATTERN)' matched against the normalized path, or
+- a predicate function called with the normalized directory path."
+  :type '(repeat (choice (directory :tag "Directory prefix")
+                         (cons :tag "Regexp" (const regexp) regexp)
+                         (function :tag "Predicate")))
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-diffstat-enable t
+  "When non-nil, run secondary `git diff --numstat HEAD' jobs for dirty repos."
+  :type 'boolean
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-status-extra-args nil
+  "Extra arguments appended to `git status --porcelain=v2 -z --branch'.
+For example, `(\"--untracked-files=no\")' or `(\"--ignore-submodules=dirty\")'."
+  :type '(repeat string)
+  :group 'herdr-sanctum-git)
+
+(defcustom herdr-sanctum-git-command-timeout 15.0
+  "Maximum seconds an async `git' subprocess may run before being killed.
+Set to nil to disable command timeouts."
+  :type '(choice (number :tag "Seconds")
+                 (const :tag "No timeout" nil))
+  :group 'herdr-sanctum-git)
+
 (defcustom herdr-sanctum-git-cache-ttl 5.0
   "Minimum seconds between async `git status' polls for the same directory."
   :type 'number
@@ -71,12 +125,17 @@ Set to 0 to disable child repository discovery."
   :type '(repeat directory)
   :group 'herdr-sanctum-git)
 
+(defvaralias 'herdr-sanctum-git--subrepo-skip-names
+  'herdr-sanctum-git-subrepo-skip-names)
+
+(defcustom herdr-sanctum-git-subrepo-skip-names
+  '("node_modules" "vendor" "target" "dist" "build" "__pycache__" ".venv")
+  "Directory names skipped during child Git repository discovery."
+  :type '(repeat string)
+  :group 'herdr-sanctum-git)
+
 (defconst herdr-sanctum-git-subrepo-max-inspected 200
   "Maximum directory entries inspected during a single subrepo discovery walk.")
-
-(defconst herdr-sanctum-git--subrepo-skip-names
-  '("node_modules" "vendor" "target" "dist" "build" "__pycache__" ".venv")
-  "Directory names skipped during child Git repository discovery.")
 
 (defconst herdr-sanctum-git--max-concurrency 4
   "Global maximum number of concurrent async `git' processes.")
@@ -84,14 +143,17 @@ Set to 0 to disable child repository discovery."
 (defconst herdr-sanctum-git--cache-max-entries 128
   "Maximum number of directories retained in `herdr-sanctum-git--cache'.")
 
-(defvar herdr-sanctum-git--executable nil
-  "Cached path to the `git' executable, or nil before a successful lookup.")
-
 (defvar herdr-sanctum-git--cache (make-hash-table :test #'equal)
-  "Async Git cache keyed by normalized directory path.
+  "Async Git cache keyed by canonical repo root or normalized directory path.
 Each value is a cons cell `(INFO . META)', where INFO is a pure Git status
 plist (or `(:not-repo t)') and META holds `:updated-at', `:subrepos', and
 `:subrepos-at'.")
+
+(defvar herdr-sanctum-git--dir-to-root (make-hash-table :test #'equal)
+  "Map from normalized workspace directory to canonical Git repository root.")
+
+(defvar herdr-sanctum-git--truename-to-root (make-hash-table :test #'equal)
+  "Map from `file-truename' of a Git repo root to its canonical cache key.")
 
 (defvar herdr-sanctum-git--inflight (make-hash-table :test #'equal)
   "In-flight async `git' processes keyed by job key.")
@@ -109,9 +171,120 @@ plist (or `(:not-repo t)') and META holds `:updated-at', `:subrepos', and
   "Set of normalized parent directories with coalesced `subdiff' updates.")
 
 (defun herdr-sanctum-git--executable ()
-  "Return cached path to `git', retrying `exec-path' lookup until found."
-  (or herdr-sanctum-git--executable
-      (setq herdr-sanctum-git--executable (executable-find "git"))))
+  "Return cached path to `herdr-sanctum-git-program', retrying until found."
+  (if (and herdr-sanctum-git--executable
+           (or (null herdr-sanctum-git--executable-program)
+               (equal herdr-sanctum-git--executable-program
+                      herdr-sanctum-git-program)))
+      herdr-sanctum-git--executable
+    (setq herdr-sanctum-git--executable nil
+          herdr-sanctum-git--executable-program nil)
+    (when-let* ((found (and (stringp herdr-sanctum-git-program)
+                            (not (string-empty-p herdr-sanctum-git-program))
+                            (executable-find herdr-sanctum-git-program))))
+      (setq herdr-sanctum-git--executable found
+            herdr-sanctum-git--executable-program herdr-sanctum-git-program)
+      found)))
+
+(defun herdr-sanctum-git--status-args (dir)
+  "Build `git status' argument vector for DIR with configured extra flags."
+  (append (list "-c" "status.relativePaths=false"
+                "-C" dir
+                "status" "--porcelain=v2" "-z" "--branch")
+          herdr-sanctum-git-status-extra-args))
+
+(defun herdr-sanctum-git--remote-dir-p (dir)
+  "Return non-nil when DIR denotes a remote directory."
+  (or (file-remote-p dir)
+      (and (not (file-name-absolute-p dir))
+           (stringp default-directory)
+           (file-remote-p default-directory))))
+
+(defun herdr-sanctum-git--poll-excluded-p (norm)
+  "Return non-nil when NORM matches `herdr-sanctum-git-exclude-dirs'."
+  (seq-some
+   (lambda (rule)
+     (cond
+      ((stringp rule)
+       (string-prefix-p (file-name-as-directory (expand-file-name rule)) norm))
+      ((and (consp rule) (eq (car rule) 'regexp) (stringp (cdr rule)))
+       (string-match-p (cdr rule) norm))
+      ((functionp rule)
+       (funcall rule norm))))
+   herdr-sanctum-git-exclude-dirs))
+
+(defun herdr-sanctum-git--find-repo-root (dir)
+  "Return canonical Git repository root for local directory DIR, or nil.
+Returns nil for remote directories, nonexistent directories, and non-Git
+directories (such as multi-repo parent directories).  Supports Git worktrees
+\(where `.git' is a regular file) and symlinks into a Git repository."
+  (when (and (stringp dir) (not (herdr-sanctum-git--remote-dir-p dir)))
+    (let ((norm (file-name-as-directory (expand-file-name dir))))
+      (when (file-directory-p norm)
+        (let* ((true-norm (or (ignore-errors
+                                (file-name-as-directory (file-truename norm)))
+                              norm))
+               (dom (or (locate-dominating-file norm ".git")
+                        (unless (or (equal true-norm norm)
+                                    (file-remote-p true-norm))
+                          (locate-dominating-file true-norm ".git")))))
+          (when dom
+            (let* ((cand (file-name-as-directory (expand-file-name dom)))
+                   (true-cand (or (ignore-errors
+                                    (file-name-as-directory (file-truename cand)))
+                                  cand))
+                   (existing (gethash true-cand herdr-sanctum-git--truename-to-root)))
+              (if (and existing (file-directory-p existing))
+                  existing
+                (if (file-symlink-p (directory-file-name cand))
+                    true-cand
+                  cand)))))))))
+
+(defun herdr-sanctum-git--record-dir-root (norm root)
+  "Map normalized directory NORM to canonical Git repository ROOT.
+Return non-nil when NORM was not previously mapped to ROOT."
+  (let ((prev (gethash norm herdr-sanctum-git--dir-to-root)))
+    (unless (equal prev root)
+      (puthash norm root herdr-sanctum-git--dir-to-root)
+      (unless (equal norm root)
+        (remhash norm herdr-sanctum-git--cache))
+      (when-let* ((true-root (ignore-errors
+                               (file-name-as-directory (file-truename root)))))
+        (unless (gethash true-root herdr-sanctum-git--truename-to-root)
+          (puthash true-root root herdr-sanctum-git--truename-to-root)))
+      t)))
+
+(defun herdr-sanctum-git--mapped-dirs-for-root (root)
+  "Return list of normalized directories mapped to ROOT in `--dir-to-root'."
+  (let ((dirs nil))
+    (maphash (lambda (dir mapped)
+               (when (equal mapped root)
+                 (push dir dirs)))
+             herdr-sanctum-git--dir-to-root)
+    dirs))
+
+(defun herdr-sanctum-git--remove-root-mappings (root)
+  "Remove all `--dir-to-root' and `--truename-to-root' entries targeting ROOT.
+Return the list of removed directory keys from `--dir-to-root'."
+  (let ((dirs (herdr-sanctum-git--mapped-dirs-for-root root))
+        (true-keys nil))
+    (dolist (dir dirs)
+      (remhash dir herdr-sanctum-git--dir-to-root))
+    (maphash (lambda (tk val)
+               (when (equal val root)
+                 (push tk true-keys)))
+             herdr-sanctum-git--truename-to-root)
+    (dolist (tk true-keys)
+      (remhash tk herdr-sanctum-git--truename-to-root))
+    dirs))
+
+(defun herdr-sanctum-git--notify-update (key info)
+  "Run `herdr-sanctum-git-update-hook' for KEY or its mapped dirs with INFO."
+  (let ((targets (or (herdr-sanctum-git--mapped-dirs-for-root key)
+                     (list key))))
+    (dolist (dir targets)
+      (run-hook-with-args 'herdr-sanctum-git-update-hook dir info))
+    (force-mode-line-update t)))
 
 ;;; Cache & Metadata Helpers
 
@@ -120,14 +293,33 @@ plist (or `(:not-repo t)') and META holds `:updated-at', `:subrepos', and
   (let ((overflow (- (hash-table-count herdr-sanctum-git--cache)
                      herdr-sanctum-git--cache-max-entries)))
     (when (> overflow 0)
-      (let ((entries nil))
+      (let ((entries nil)
+            (evicted (make-hash-table :test #'equal)))
         (maphash (lambda (k entry)
                    (push (cons (or (plist-get (cdr entry) :updated-at) 0.0) k)
                          entries))
                  herdr-sanctum-git--cache)
         (setq entries (sort entries (lambda (a b) (< (car a) (car b)))))
         (dolist (entry (seq-take entries overflow))
-          (remhash (cdr entry) herdr-sanctum-git--cache))))))
+          (let ((key (cdr entry)))
+            (remhash key herdr-sanctum-git--cache)
+            (unless (gethash key herdr-sanctum-git--inflight)
+              (puthash key t evicted))))
+        (when (> (hash-table-count evicted) 0)
+          (let ((stale-dirs nil)
+                (stale-trues nil))
+            (maphash (lambda (dir root)
+                       (when (gethash root evicted)
+                         (push dir stale-dirs)))
+                     herdr-sanctum-git--dir-to-root)
+            (dolist (dir stale-dirs)
+              (remhash dir herdr-sanctum-git--dir-to-root))
+            (maphash (lambda (tr root)
+                       (when (gethash root evicted)
+                         (push tr stale-trues)))
+                     herdr-sanctum-git--truename-to-root)
+            (dolist (tr stale-trues)
+              (remhash tr herdr-sanctum-git--truename-to-root))))))))
 
 (defun herdr-sanctum-git--commit-cache (norm info &optional meta defer-notify)
   "Store pure semantic Git state INFO for NORM and update metadata META.
@@ -160,8 +352,7 @@ is non-nil, record NORM for coalesced notification instead of firing
      ((and (not defer-notify)
            (or changed (gethash norm herdr-sanctum-git--deferred-notify)))
       (remhash norm herdr-sanctum-git--deferred-notify)
-      (run-hook-with-args 'herdr-sanctum-git-update-hook norm stored)
-      (force-mode-line-update t)))))
+      (herdr-sanctum-git--notify-update norm stored)))))
 
 ;;; Global Focus-Prioritized Concurrency Scheduler
 
@@ -199,10 +390,14 @@ queue."
         t)))))
 
 (defun herdr-sanctum-git--delete-process (proc)
-  "Delete async Git process PROC and any attached stderr pipe process."
+  "Delete async Git process PROC, its timeout timer, and its stderr pipe."
   (when (processp proc)
-    (let ((stderr (process-get proc 'herdr-sanctum-git-stderr)))
+    (let ((timer (process-get proc 'herdr-sanctum-git-timer))
+          (stderr (process-get proc 'herdr-sanctum-git-stderr)))
+      (process-put proc 'herdr-sanctum-git-timer nil)
       (process-put proc 'herdr-sanctum-git-stderr nil)
+      (when (timerp timer)
+        (cancel-timer timer))
       (when (process-live-p proc)
         (delete-process proc))
       (when (and (processp stderr) (process-live-p stderr))
@@ -221,7 +416,9 @@ queue."
       (let* ((key (plist-get job :key))
              (norm (plist-get job :norm))
              (default-directory
-              (if (and (stringp norm) (file-directory-p norm))
+              (if (and (stringp norm)
+                       (not (file-remote-p norm))
+                       (file-directory-p norm))
                   norm
                 temporary-file-directory))
              (git-bin (herdr-sanctum-git--executable))
@@ -242,7 +439,10 @@ queue."
                       (make-process
                        :name (plist-get job :name)
                        :buffer nil
-                       :command (cons git-bin (cons "--no-pager" (plist-get job :args)))
+                       :command (cons git-bin
+                                      (cons "--no-pager"
+                                            (cons "--no-optional-locks"
+                                                  (plist-get job :args))))
                        :connection-type 'pipe
                        :coding 'utf-8-unix
                        :noquery t
@@ -252,6 +452,10 @@ queue."
                        (lambda (p _event)
                          (unless (process-live-p p)
                            (setq done t)
+                           (let ((timer (process-get p 'herdr-sanctum-git-timer)))
+                             (process-put p 'herdr-sanctum-git-timer nil)
+                             (when (timerp timer)
+                               (cancel-timer timer)))
                            (process-put p 'herdr-sanctum-git-stderr nil)
                            (when (and (processp stderr-proc)
                                       (process-live-p stderr-proc))
@@ -259,16 +463,17 @@ queue."
                            (let ((active (eq (gethash key herdr-sanctum-git--inflight) p)))
                              (when active
                                (remhash key herdr-sanctum-git--inflight))
-                             (cond
-                              ((and active (eq (process-status p) 'exit))
-                               (funcall on-exit
-                                        (process-exit-status p)
-                                        (apply #'concat (nreverse chunks))
-                                        p
-                                        job))
-                              ((and active on-error)
-                               (funcall on-error job))))
-                           (herdr-sanctum-git--pump-jobs)))))
+                             (unwind-protect
+                                 (cond
+                                  ((and active (eq (process-status p) 'exit))
+                                   (funcall on-exit
+                                            (process-exit-status p)
+                                            (apply #'concat (nreverse chunks))
+                                            p
+                                            job))
+                                  ((and active on-error)
+                                   (funcall on-error job)))
+                               (herdr-sanctum-git--pump-jobs)))))))
                   (error
                    (when (and (processp stderr-proc) (process-live-p stderr-proc))
                      (delete-process stderr-proc))
@@ -276,7 +481,22 @@ queue."
         (cond
          ((and (processp proc) (not done))
           (process-put proc 'herdr-sanctum-git-stderr stderr-proc)
-          (puthash key proc herdr-sanctum-git--inflight))
+          (puthash key proc herdr-sanctum-git--inflight)
+          (when (and (numberp herdr-sanctum-git-command-timeout)
+                     (> herdr-sanctum-git-command-timeout 0))
+            (let ((timeout-proc proc))
+              (process-put
+               timeout-proc 'herdr-sanctum-git-timer
+               (run-with-timer
+                herdr-sanctum-git-command-timeout nil
+                (lambda ()
+                  (process-put timeout-proc 'herdr-sanctum-git-timer nil)
+                  (when (eq (gethash key herdr-sanctum-git--inflight) timeout-proc)
+                    (remhash key herdr-sanctum-git--inflight)
+                    (herdr-sanctum-git--delete-process timeout-proc)
+                    (unwind-protect
+                        (when on-error (funcall on-error job))
+                      (herdr-sanctum-git--pump-jobs)))))))))
          ((null proc)
           (when on-error (funcall on-error job))))))))
 
@@ -294,7 +514,8 @@ queue."
 (cl-defun herdr-sanctum-git--enqueue-git
     (&key key norm name args priority with-diffstat guard on-exit on-error)
   "Queue an async `git' job with KEY for NORM, deduplicating live/queued jobs.
-NAME is the process name, ARGS are passed after `git --no-pager', PRIORITY
+NAME is the process name, ARGS are passed after
+`git --no-pager --no-optional-locks', PRIORITY
 places the job in the high-priority FIFO queue, WITH-DIFFSTAT marks the job
 as requesting diffstats, GUARD (if non-nil) suppresses launch when it returns
 nil, ON-EXIT is called as `(EXIT-CODE OUTPUT PROC JOB)' on normal exit, and
@@ -339,8 +560,7 @@ ON-ERROR is called as `(JOB)' if `make-process' fails."
              (not (herdr-sanctum-git--has-pending-subdiff-p norm)))
     (remhash norm herdr-sanctum-git--deferred-notify)
     (when-let* ((stored (car (gethash norm herdr-sanctum-git--cache))))
-      (run-hook-with-args 'herdr-sanctum-git-update-hook norm stored)
-      (force-mode-line-update t))))
+      (herdr-sanctum-git--notify-update norm stored))))
 
 (defun herdr-sanctum-git--cancel-dir-jobs (norm)
   "Abort queued and in-flight Git jobs belonging to directory NORM."
@@ -394,6 +614,8 @@ Return nil when REL or the resolved base directory is missing."
   "Discover child Git repositories beneath DIR via bounded breadth-first search.
 Return an alist of `(REL-NAME . ABS-NORM-DIR)' sorted by REL-NAME."
   (when (and (stringp dir)
+             (not (and herdr-sanctum-git-skip-remote
+                       (herdr-sanctum-git--remote-dir-p dir)))
              (> herdr-sanctum-git-subrepo-max-depth 0)
              (> herdr-sanctum-git-subrepo-max-count 0)
              (> herdr-sanctum-git-subrepo-max-inspected 0))
@@ -428,7 +650,7 @@ Return an alist of `(REL-NAME . ABS-NORM-DIR)' sorted by REL-NAME."
                               (< inspected max-inspected))
                     (let ((name (pop entries)))
                       (unless (or (string-prefix-p "." name)
-                                  (member name herdr-sanctum-git--subrepo-skip-names))
+                                  (member name herdr-sanctum-git-subrepo-skip-names))
                         (cl-incf inspected)
                         (let ((child (expand-file-name name parent-dir)))
                           (when (eq (car (file-attributes child 'integer)) t)
@@ -597,68 +819,70 @@ Return an alist of `(REL-NAME . ABS-NORM-DIR)' sorted by REL-NAME."
 
 (defun herdr-sanctum-git--fetch-diffstat (dir)
   "Asynchronously update `:added' and `:removed' counts for DIR."
-  (herdr-sanctum-git--enqueue-git
-   :key (concat "diffstat:" dir)
-   :norm dir
-   :name "herdr-sanctum-git-diffstat"
-   :args (list "-C" dir "diff" "--numstat" "HEAD")
-   :priority t
-   :on-exit
-   (lambda (exit-code output _proc _job)
-     (let* ((ok (zerop exit-code))
-            (counts (when ok (herdr-sanctum-git-parse-numstat output)))
-            (info (car (gethash dir herdr-sanctum-git--cache))))
-       (when (and info
-                  (not (plist-get info :not-repo))
-                  (not (plist-get info :multi-repo))
-                  (> (or (plist-get info :dirty) 0) 0))
-         (let* ((added (if ok (car counts) (or (plist-get info :added) 0)))
-                (removed (if ok (cdr counts) (or (plist-get info :removed) 0)))
-                (updated (plist-put (plist-put (copy-sequence info) :added added)
-                                    :removed removed)))
-           (herdr-sanctum-git--commit-cache dir updated)))))))
+  (when herdr-sanctum-git-diffstat-enable
+    (herdr-sanctum-git--enqueue-git
+     :key (concat "diffstat:" dir)
+     :norm dir
+     :name "herdr-sanctum-git-diffstat"
+     :args (list "-C" dir "diff" "--numstat" "HEAD")
+     :priority t
+     :on-exit
+     (lambda (exit-code output _proc _job)
+       (let* ((ok (zerop exit-code))
+              (counts (when ok (herdr-sanctum-git-parse-numstat output)))
+              (info (car (gethash dir herdr-sanctum-git--cache))))
+         (when (and info
+                    (not (plist-get info :not-repo))
+                    (not (plist-get info :multi-repo))
+                    (> (or (plist-get info :dirty) 0) 0))
+           (let* ((added (if ok (car counts) (or (plist-get info :added) 0)))
+                  (removed (if ok (cdr counts) (or (plist-get info :removed) 0)))
+                  (updated (plist-put (plist-put (copy-sequence info) :added added)
+                                      :removed removed)))
+             (herdr-sanctum-git--commit-cache dir updated))))))))
 
 (defun herdr-sanctum-git--fetch-subrepo-diffstat (norm sub-dir)
   "Queue an async `:added'/`:removed' update for SUB-DIR in multi-repo NORM."
-  (herdr-sanctum-git--enqueue-git
-   :key (concat "subdiff:" norm ":" sub-dir)
-   :norm norm
-   :name "herdr-sanctum-git-subdiff"
-   :args (list "-C" sub-dir "diff" "--numstat" "HEAD")
-   :priority t
-   :on-error (lambda (_job) (herdr-sanctum-git--flush-deferred-notify norm))
-   :on-exit
-   (lambda (exit-code output _proc _job)
-     (let* ((info (car (gethash norm herdr-sanctum-git--cache)))
-            (ok (zerop exit-code))
-            (counts (when ok (herdr-sanctum-git-parse-numstat output)))
-            (changed nil))
-       (when (and info (plist-get info :multi-repo))
-         (let ((updated-repos
-                (mapcar
-                 (lambda (repo)
-                   (if (and (equal (plist-get repo :dir) sub-dir)
-                            (> (or (plist-get repo :dirty) 0) 0))
-                       (let* ((copy (copy-sequence repo))
-                              (added (if ok
-                                         (car counts)
-                                       (or (plist-get copy :added) 0)))
-                              (removed (if ok
-                                           (cdr counts)
-                                         (or (plist-get copy :removed) 0))))
-                         (setq changed t)
-                         (plist-put (plist-put copy :added added)
-                                    :removed removed))
-                     repo))
-                 (plist-get info :repos))))
-           (when changed
-             (herdr-sanctum-git--commit-cache
-              norm
-              (herdr-sanctum-git--aggregate-multi-repo norm updated-repos)
-              nil
-              (herdr-sanctum-git--has-pending-subdiff-p norm)))))
-       (unless changed
-         (herdr-sanctum-git--flush-deferred-notify norm))))))
+  (when herdr-sanctum-git-diffstat-enable
+    (herdr-sanctum-git--enqueue-git
+     :key (concat "subdiff:" norm ":" sub-dir)
+     :norm norm
+     :name "herdr-sanctum-git-subdiff"
+     :args (list "-C" sub-dir "diff" "--numstat" "HEAD")
+     :priority t
+     :on-error (lambda (_job) (herdr-sanctum-git--flush-deferred-notify norm))
+     :on-exit
+     (lambda (exit-code output _proc _job)
+       (let* ((info (car (gethash norm herdr-sanctum-git--cache)))
+              (ok (zerop exit-code))
+              (counts (when ok (herdr-sanctum-git-parse-numstat output)))
+              (changed nil))
+         (when (and info (plist-get info :multi-repo))
+           (let ((updated-repos
+                  (mapcar
+                   (lambda (repo)
+                     (if (and (equal (plist-get repo :dir) sub-dir)
+                              (> (or (plist-get repo :dirty) 0) 0))
+                         (let* ((copy (copy-sequence repo))
+                                (added (if ok
+                                           (car counts)
+                                         (or (plist-get copy :added) 0)))
+                                (removed (if ok
+                                             (cdr counts)
+                                           (or (plist-get copy :removed) 0))))
+                           (setq changed t)
+                           (plist-put (plist-put copy :added added)
+                                      :removed removed))
+                       repo))
+                   (plist-get info :repos))))
+             (when changed
+               (herdr-sanctum-git--commit-cache
+                norm
+                (herdr-sanctum-git--aggregate-multi-repo norm updated-repos)
+                nil
+                (herdr-sanctum-git--has-pending-subdiff-p norm)))))
+         (unless changed
+           (herdr-sanctum-git--flush-deferred-notify norm)))))))
 
 (defun herdr-sanctum-git--finish-multi-status (norm batch)
   "Commit completed multi-repo status BATCH for NORM and kick off diffstats."
@@ -674,7 +898,8 @@ Return an alist of `(REL-NAME . ABS-NORM-DIR)' sorted by REL-NAME."
             (meta (list :subrepos (plist-get batch :subrepos)
                         :subrepos-at (plist-get batch :subrepos-at))))
         (herdr-sanctum-git--commit-cache norm agg meta)
-        (when (plist-get batch :with-diffstat)
+        (when (and (plist-get batch :with-diffstat)
+                   herdr-sanctum-git-diffstat-enable)
           (dolist (repo repos)
             (when (> (plist-get repo :dirty) 0)
               (let ((sub-dir (plist-get repo :dir)))
@@ -721,9 +946,7 @@ subrepos."
              :key (concat "substatus:" norm ":" sub-dir)
              :norm norm
              :name "herdr-sanctum-git-substatus"
-             :args (list "-c" "status.relativePaths=false"
-                         "-C" sub-dir
-                         "status" "--porcelain=v2" "-z" "--branch")
+             :args (herdr-sanctum-git--status-args sub-dir)
              :priority with-diffstat
              :guard (lambda () (eq (gethash norm herdr-sanctum-git--multi-pending) batch))
              :on-error (lambda (_job) (herdr-sanctum-git--complete-multi-item norm batch))
@@ -750,20 +973,49 @@ subrepos."
 
 ;;; Public Entry Points
 
+(defun herdr-sanctum-git--evict-deleted-dir (norm)
+  "Evict cache, mappings, and jobs for deleted normalized directory NORM."
+  (let ((mapped-root (gethash norm herdr-sanctum-git--dir-to-root)))
+    (cond
+     ;; Deleted subdir of a still-existing repository: detach only this subdir.
+     ((and mapped-root
+           (not (equal mapped-root norm))
+           (file-directory-p mapped-root))
+      (remhash norm herdr-sanctum-git--dir-to-root)
+      (when (gethash mapped-root herdr-sanctum-git--cache)
+        (run-hook-with-args 'herdr-sanctum-git-update-hook norm nil)
+        (force-mode-line-update t)))
+     (t
+      (let* ((target (or mapped-root norm))
+             (had-entry (or (gethash target herdr-sanctum-git--cache)
+                            (and (not (equal target norm))
+                                 (gethash norm herdr-sanctum-git--cache))))
+             (affected (herdr-sanctum-git--remove-root-mappings target)))
+        (herdr-sanctum-git--cancel-dir-jobs target)
+        (unless (equal target norm)
+          (herdr-sanctum-git--cancel-dir-jobs norm)
+          (remhash norm herdr-sanctum-git--cache))
+        (remhash target herdr-sanctum-git--cache)
+        (when had-entry
+          (dolist (d (or affected (list norm)))
+            (run-hook-with-args 'herdr-sanctum-git-update-hook d nil))
+          (force-mode-line-update t)))))))
+
 (defun herdr-sanctum-git--handle-status-exit (norm force exit-code output proc job)
   "Handle completion of an async `git status' process for NORM."
-  (let ((want-diffstat
-         (or (plist-get job :with-diffstat)
-             (process-get proc 'herdr-sanctum-with-diffstat)))
-        (prev (car (gethash norm herdr-sanctum-git--cache))))
+  (let* ((requested-diffstat
+          (or (plist-get job :with-diffstat)
+              (process-get proc 'herdr-sanctum-with-diffstat)))
+         (want-diffstat (and herdr-sanctum-git-diffstat-enable
+                             requested-diffstat))
+         (prev (car (gethash norm herdr-sanctum-git--cache))))
     (if (zerop exit-code)
         (let* ((root (or (and (not force)
                               prev
                               (not (plist-get prev :multi-repo))
                               (plist-get prev :root))
-                         (if-let* ((dom (locate-dominating-file norm ".git")))
-                             (file-name-as-directory (expand-file-name dom))
-                           norm)))
+                         (herdr-sanctum-git--find-repo-root norm)
+                         norm))
                (parsed (plist-put (herdr-sanctum-git-parse-status output)
                                   :root root)))
           (if (> (plist-get parsed :dirty) 0)
@@ -786,92 +1038,165 @@ subrepos."
             (herdr-sanctum-git--commit-cache norm parsed)))
       (let ((subrepos (herdr-sanctum-git--discover-subrepos norm)))
         (if subrepos
-            (herdr-sanctum-git--fetch-multi-repo
-             norm subrepos want-diffstat (float-time))
-          (herdr-sanctum-git--commit-cache norm (list :not-repo t)))))))
+            (progn
+              (herdr-sanctum-git--remove-root-mappings norm)
+              (herdr-sanctum-git--fetch-multi-repo
+               norm subrepos requested-diffstat (float-time)))
+          (herdr-sanctum-git--commit-cache norm (list :not-repo t))
+          (herdr-sanctum-git--remove-root-mappings norm))))))
+
+(defun herdr-sanctum-git--cache-fresh-p (key now)
+  "Return non-nil when KEY has a cached entry in `--cache' within its TTL at NOW."
+  (when-let* ((entry (gethash key herdr-sanctum-git--cache)))
+    (let* ((cached (car entry))
+           (meta (cdr entry))
+           (ttl (if (and cached (plist-get cached :not-repo))
+                    herdr-sanctum-git-non-repo-ttl
+                  herdr-sanctum-git-cache-ttl)))
+      (< (- now (or (plist-get meta :updated-at) 0.0)) ttl))))
 
 (defun herdr-sanctum-git-fetch-dir (dir &optional force with-diffstat)
   "Asynchronously poll Git status for DIR into `herdr-sanctum-git--cache'.
 When FORCE is non-nil, ignore `herdr-sanctum-git-cache-ttl' and cancel any
 in-flight poll for DIR before starting a fresh fetch.
 When WITH-DIFFSTAT is non-nil, prioritize the job and fetch line diff stats
-for dirty repos."
-  (when (stringp dir)
-    (let* ((norm (file-name-as-directory (expand-file-name dir)))
-           (now (float-time))
-           (entry (gethash norm herdr-sanctum-git--cache))
-           (cached (car entry))
-           (cached-meta (cdr entry))
-           (ttl (if (and cached (plist-get cached :not-repo))
-                    herdr-sanctum-git-non-repo-ttl
-                  herdr-sanctum-git-cache-ttl))
-           (age (if cached (- now (or (plist-get cached-meta :updated-at) 0.0)) 1e9)))
-      (when force
-        (herdr-sanctum-git--cancel-dir-jobs norm))
-      (cond
-       ((not (file-directory-p norm))
-        (herdr-sanctum-git--cancel-dir-jobs norm)
-        (when entry
-          (remhash norm herdr-sanctum-git--cache)
-          (run-hook-with-args 'herdr-sanctum-git-update-hook norm nil)
-          (force-mode-line-update t)))
-       ((when-let* ((pending-multi (gethash norm herdr-sanctum-git--multi-pending)))
-          (when with-diffstat
-            (puthash norm (plist-put pending-multi :with-diffstat t)
-                     herdr-sanctum-git--multi-pending))
-          t))
-       ((herdr-sanctum-git--upgrade-pending-job norm with-diffstat with-diffstat))
-       ((and (not force) (< age ttl))
-        (when (and with-diffstat
-                   cached
-                   (not (plist-get cached :not-repo))
-                   (> (or (plist-get cached :dirty) 0) 0))
-          (if (plist-get cached :multi-repo)
-              (dolist (repo (plist-get cached :repos))
-                (when (and (> (or (plist-get repo :dirty) 0) 0)
-                           (null (plist-get repo :added)))
-                  (herdr-sanctum-git--fetch-subrepo-diffstat
-                   norm (plist-get repo :dir))))
-            (when (null (plist-get cached :added))
-              (herdr-sanctum-git--fetch-diffstat norm)))))
-       ((herdr-sanctum-git--executable)
-        (if-let* ((prev-subrepos (and (not force)
-                                      cached
-                                      (plist-get cached :multi-repo)
-                                      (plist-get cached-meta :subrepos)))
-                  (prev-sub-at (or (plist-get cached-meta :subrepos-at) 0.0))
-                  ((< (- now prev-sub-at) herdr-sanctum-git-non-repo-ttl))
-                  (live-subrepos (cl-remove-if-not
-                                  (lambda (s) (file-directory-p (cdr s)))
-                                  prev-subrepos)))
-            (herdr-sanctum-git--fetch-multi-repo
-             norm live-subrepos with-diffstat prev-sub-at)
-          (herdr-sanctum-git--enqueue-git
-           :key norm
-           :norm norm
-           :name "herdr-sanctum-git-status"
-           :args (list "-c" "status.relativePaths=false"
-                       "-C" norm "status" "--porcelain=v2" "-z" "--branch")
-           :priority (or with-diffstat force)
-           :with-diffstat with-diffstat
-           :on-exit (lambda (exit-code output proc job)
-                      (herdr-sanctum-git--handle-status-exit
-                       norm force exit-code output proc job)))))))))
+for dirty repos when `herdr-sanctum-git-diffstat-enable' is non-nil."
+  (when (and herdr-sanctum-git-enable
+             (stringp dir)
+             (not (and herdr-sanctum-git-skip-remote
+                       (herdr-sanctum-git--remote-dir-p dir))))
+    (let ((norm (file-name-as-directory (expand-file-name dir))))
+      (unless (herdr-sanctum-git--poll-excluded-p norm)
+        (if (not (file-directory-p norm))
+            (herdr-sanctum-git--evict-deleted-dir norm)
+          (let* ((now (float-time))
+                 (mapped-root (gethash norm herdr-sanctum-git--dir-to-root))
+                 (root
+                  (cond
+                   (force
+                    (let ((found (herdr-sanctum-git--find-repo-root norm)))
+                      (when (and mapped-root (null found))
+                        (remhash norm herdr-sanctum-git--dir-to-root))
+                      found))
+                   ((and mapped-root
+                         (herdr-sanctum-git--cache-fresh-p mapped-root now))
+                    mapped-root)
+                   ((and (null mapped-root)
+                         (or (gethash norm herdr-sanctum-git--multi-pending)
+                             (herdr-sanctum-git--cache-fresh-p norm now)))
+                    nil)
+                   (t
+                    (let ((found (herdr-sanctum-git--find-repo-root norm)))
+                      (when (and mapped-root (null found))
+                        (remhash norm herdr-sanctum-git--dir-to-root))
+                      found)))))
+            (unless (and root
+                         (not (equal root norm))
+                         (herdr-sanctum-git--poll-excluded-p root))
+              (let* ((newly-mapped
+                      (when root
+                        (herdr-sanctum-git--record-dir-root norm root)))
+                     (target (or root norm))
+                     (entry (gethash target herdr-sanctum-git--cache))
+                     (cached (car entry))
+                     (cached-meta (cdr entry))
+                     (ttl (if (and cached (plist-get cached :not-repo))
+                              herdr-sanctum-git-non-repo-ttl
+                            herdr-sanctum-git-cache-ttl))
+                     (age (if cached
+                              (- now (or (plist-get cached-meta :updated-at) 0.0))
+                            1e9)))
+                (when force
+                  (herdr-sanctum-git--cancel-dir-jobs target))
+                (cond
+                 ((when-let* ((pending-multi (gethash target herdr-sanctum-git--multi-pending)))
+                    (when (and with-diffstat herdr-sanctum-git-diffstat-enable)
+                      (puthash target (plist-put pending-multi :with-diffstat t)
+                               herdr-sanctum-git--multi-pending))
+                    t))
+                 ((herdr-sanctum-git--upgrade-pending-job target with-diffstat with-diffstat))
+                 ((and (not force) (< age ttl))
+                  (when (and newly-mapped cached (not (plist-get cached :not-repo)))
+                    (run-hook-with-args 'herdr-sanctum-git-update-hook norm cached)
+                    (force-mode-line-update t))
+                  (when (and with-diffstat
+                             herdr-sanctum-git-diffstat-enable
+                             cached
+                             (not (plist-get cached :not-repo))
+                             (> (or (plist-get cached :dirty) 0) 0))
+                    (if (plist-get cached :multi-repo)
+                        (dolist (repo (plist-get cached :repos))
+                          (when (and (> (or (plist-get repo :dirty) 0) 0)
+                                     (null (plist-get repo :added)))
+                            (herdr-sanctum-git--fetch-subrepo-diffstat
+                             target (plist-get repo :dir))))
+                      (when (null (plist-get cached :added))
+                        (herdr-sanctum-git--fetch-diffstat target)))))
+                 ((herdr-sanctum-git--executable)
+                  (if-let* ((prev-subrepos (and (not force)
+                                                (null root)
+                                                cached
+                                                (plist-get cached :multi-repo)
+                                                (plist-get cached-meta :subrepos)))
+                            (prev-sub-at (or (plist-get cached-meta :subrepos-at) 0.0))
+                            ((< (- now prev-sub-at) herdr-sanctum-git-non-repo-ttl))
+                            (live-subrepos (cl-remove-if-not
+                                            (lambda (s) (file-directory-p (cdr s)))
+                                            prev-subrepos)))
+                      (herdr-sanctum-git--fetch-multi-repo
+                       target live-subrepos with-diffstat prev-sub-at)
+                    (herdr-sanctum-git--enqueue-git
+                     :key target
+                     :norm target
+                     :name "herdr-sanctum-git-status"
+                     :args (herdr-sanctum-git--status-args target)
+                     :priority (or with-diffstat force)
+                     :with-diffstat with-diffstat
+                     :on-exit (lambda (exit-code output proc job)
+                                (herdr-sanctum-git--handle-status-exit
+                                 target force exit-code output proc job))))))))))))))
 
 (defun herdr-sanctum-git-refresh-snapshot (snapshot &optional force)
   "Schedule async Git polls for workspaces and focused pane in SNAPSHOT.
 When FORCE is non-nil, bypass TTL throttling and visibility gating."
-  (when (or force (herdr-sanctum-any-ui-window-visible-p))
+  (when (and herdr-sanctum-git-enable
+             (or force (herdr-sanctum-any-ui-window-visible-p)))
     (let ((focused-dir (herdr-sanctum-focused-dir snapshot))
-          (seen (make-hash-table :test #'equal)))
-      (when focused-dir
-        (puthash focused-dir t seen)
-        (herdr-sanctum-git-fetch-dir focused-dir force t))
-      (dolist (ws (alist-get 'workspaces snapshot))
-        (when-let* ((dir (herdr-sanctum-workspace-dir ws snapshot)))
-          (unless (gethash dir seen)
-            (puthash dir t seen)
-            (herdr-sanctum-git-fetch-dir dir force nil)))))))
+          (seen (make-hash-table :test #'equal))
+          (seen-roots (make-hash-table :test #'equal)))
+      (cl-flet ((poll (dir with-diffstat)
+                  (unless (or (gethash dir seen)
+                              (and herdr-sanctum-git-skip-remote
+                                   (herdr-sanctum-git--remote-dir-p dir)))
+                    (puthash dir t seen)
+                    (let* ((norm (file-name-as-directory (expand-file-name dir)))
+                           (excluded (herdr-sanctum-git--poll-excluded-p norm))
+                           (root (unless excluded
+                                   (or (and (not force)
+                                            (gethash norm herdr-sanctum-git--dir-to-root))
+                                       (herdr-sanctum-git--find-repo-root norm)))))
+                      (cond
+                       (excluded nil)
+                       ((and root
+                             (not (equal root norm))
+                             (herdr-sanctum-git--poll-excluded-p root))
+                        nil)
+                       ((and root (gethash root seen-roots) (file-directory-p norm))
+                        (when (and (herdr-sanctum-git--record-dir-root norm root)
+                                   (not force))
+                          (when-let* ((cached (car (gethash root herdr-sanctum-git--cache)))
+                                      ((not (plist-get cached :not-repo))))
+                            (run-hook-with-args 'herdr-sanctum-git-update-hook norm cached)
+                            (force-mode-line-update t))))
+                       (t
+                        (when root
+                          (puthash root t seen-roots))
+                        (herdr-sanctum-git-fetch-dir dir force with-diffstat)))))))
+        (when focused-dir
+          (poll focused-dir t))
+        (dolist (ws (alist-get 'workspaces snapshot))
+          (when-let* ((dir (herdr-sanctum-workspace-dir ws snapshot)))
+            (poll dir nil)))))))
 
 (defun herdr-sanctum-git--on-duration-tick ()
   "Periodically refresh Git metadata when Sanctum UI is visible."
@@ -882,8 +1207,22 @@ When FORCE is non-nil, bypass TTL throttling and visibility gating."
   "Return cached Git status plist for DIR, or nil when absent or non-repo."
   (when (stringp dir)
     (let* ((entry (or (gethash dir herdr-sanctum-git--cache)
-                      (gethash (file-name-as-directory (expand-file-name dir))
-                               herdr-sanctum-git--cache)))
+                      (when-let* ((root (gethash dir herdr-sanctum-git--dir-to-root)))
+                        (gethash root herdr-sanctum-git--cache))))
+           (entry (or entry
+                      (unless (and herdr-sanctum-git-skip-remote
+                                   (herdr-sanctum-git--remote-dir-p dir))
+                        (let ((norm (file-name-as-directory (expand-file-name dir))))
+                          (or (gethash norm herdr-sanctum-git--cache)
+                              (when-let* ((root (gethash norm herdr-sanctum-git--dir-to-root)))
+                                (gethash root herdr-sanctum-git--cache))
+                              (when (and (> (hash-table-count herdr-sanctum-git--cache) 0)
+                                         (not (herdr-sanctum-git--poll-excluded-p norm)))
+                                (when-let* ((root (herdr-sanctum-git--find-repo-root norm))
+                                            (root-entry (gethash root herdr-sanctum-git--cache)))
+                                  (unless (plist-get (car root-entry) :multi-repo)
+                                    (herdr-sanctum-git--record-dir-root norm root)
+                                    root-entry))))))))
            (info (car entry)))
       (and info (not (plist-get info :not-repo)) info))))
 
@@ -897,6 +1236,8 @@ When FORCE is non-nil, bypass TTL throttling and visibility gating."
     (clrhash herdr-sanctum-git--multi-pending)
     (clrhash herdr-sanctum-git--inflight)
     (clrhash herdr-sanctum-git--cache)
+    (clrhash herdr-sanctum-git--dir-to-root)
+    (clrhash herdr-sanctum-git--truename-to-root)
     (clrhash herdr-sanctum-git--deferred-notify)
     (setq herdr-sanctum-git--high-queue nil
           herdr-sanctum-git--low-queue nil)

@@ -143,7 +143,8 @@ the default pane uses DIR as `foreground_cwd'."
   (when-let* ((drawer-buf (get-buffer herdr-sanctum-drawer-buffer-name)))
     (with-current-buffer drawer-buf
       (setq herdr-sanctum-drawer--files-cache nil
-            herdr-sanctum-drawer--render-key nil)))
+            herdr-sanctum-drawer--render-key nil
+            herdr-sanctum-drawer--active-keymap nil)))
   (dolist (name (list herdr-sanctum-buffer-name
                       herdr-sanctum-sidebar-buffer-name
                       herdr-sanctum-drawer-buffer-name
@@ -172,22 +173,35 @@ the default pane uses DIR as `foreground_cwd'."
   (clrhash herdr-sanctum--svg-file-cache)
   (clrhash herdr-sanctum--palette-cache)
   (clrhash herdr-sanctum--chrome-keymap-cache)
-  (clrhash herdr-sanctum-ime--panes)
+  (when (fboundp 'herdr-sanctum-ime--clear)
+    (herdr-sanctum-ime--clear))
   (setq-default herdr-sanctum-drawer--files-cache nil
                 herdr-sanctum-drawer--render-key nil
+                herdr-sanctum-drawer--active-keymap nil
                 herdr-sanctum--header-line-string nil
                 herdr-sanctum--header-line-dirty nil
-                herdr-sanctum--ellipsis-px-cache nil)
+                herdr-sanctum--ellipsis-px-cache nil
+                herdr-sanctum--panel-remap-cookies nil)
   (setq herdr-sanctum-sidebar--enabled nil
         herdr-sanctum-drawer--enabled nil
-        herdr-sanctum-drawer--tab 'overview
+        herdr-sanctum-drawer--tab nil
         herdr-sanctum-drawer--files-dir nil
         herdr-sanctum-drawer--last-focused-dir nil
         herdr-sanctum--last-theme-state nil
         herdr-sanctum-git--executable nil
+        herdr-sanctum-git--executable-program nil
         herdr-sanctum-tab-routing--last-match nil
-        herdr-sanctum-ime--focused-pane-id nil
         herdr-sanctum--mode-line-string nil
+        herdr-sanctum--header-badge-string nil
+        herdr-sanctum--previous-frame nil
+        herdr-sanctum--last-step-pane-id nil
+        herdr-sanctum--last-step-time 0.0
+        herdr-sanctum--connected-socket-path nil
+        herdr-sanctum--reconnect-attempt 0
+        herdr-sanctum--last-focus-key nil
+        herdr-sanctum--focused-dir-cache nil
+        herdr-sanctum--ws-dir-cache nil
+        herdr-sanctum--timestamps-socket nil
         herdr-sanctum--sub-ack-time nil
         herdr-sanctum--agent-sub-ack-time nil
         herdr-sanctum--events-lost-retry-count 0

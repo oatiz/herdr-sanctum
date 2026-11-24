@@ -39,12 +39,25 @@
 (require 'herdr-sanctum-ui)
 (require 'herdr-sanctum-terminal)
 
+(declare-function herdr-sanctum "herdr-sanctum" (&optional arg))
+(declare-function herdr-sanctum-drawer-collapse "herdr-sanctum-drawer" ())
 (declare-function herdr-sanctum-jump "herdr-sanctum" ())
+(declare-function hl-line-highlight "hl-line" ())
+(declare-function hl-line-unhighlight "hl-line" ())
+(defvar herdr-sanctum-drawer-side)
 
 (defgroup herdr-sanctum-sidebar nil
   "Persistent Spaces and Agents sidebar settings for `herdr-sanctum'."
   :group 'herdr-sanctum
   :prefix "herdr-sanctum-")
+
+(defun herdr-sanctum-sidebar--set-option (sym val)
+  "Set sidebar option SYM to VAL and refresh `*sanctum-spaces*' when live."
+  (set-default sym val)
+  (when (and (featurep 'herdr-sanctum-sidebar)
+             (fboundp 'herdr-sanctum-sidebar-refresh)
+             (get-buffer herdr-sanctum-sidebar-buffer-name))
+    (herdr-sanctum-sidebar-refresh)))
 
 (defcustom herdr-sanctum-sidebar-side 'left
   "Side of the frame where `*sanctum-spaces*' is displayed."
@@ -70,18 +83,71 @@
   :type '(choice (const :tag "Focused space only" focused)
                  (const :tag "All expanded" t)
                  (const :tag "All collapsed" nil))
-  :group 'herdr-sanctum-sidebar)
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
 
 (defcustom herdr-sanctum-sidebar-sections '(spaces agents)
   "Ordered list of sections rendered in `*sanctum-spaces*'.
 Supported symbols are `spaces' and `agents'."
   :type '(repeat (choice (const :tag "Spaces" spaces)
                          (const :tag "Agents" agents)))
-  :group 'herdr-sanctum-sidebar)
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
+
+(defcustom herdr-sanctum-sidebar-show-idle-agents t
+  "When non-nil, include idle agents in the `*sanctum-spaces*' Agents section."
+  :type 'boolean
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
+
+(defcustom herdr-sanctum-sidebar-agent-statuses '("blocked" "working" "done" "idle")
+  "Ordered list of agent status groups rendered in `*sanctum-spaces*'.
+Supported values are \"blocked\", \"working\", \"done\", and \"idle\".
+Setting `herdr-sanctum-sidebar-show-idle-agents' to nil hides \"idle\"
+even when it appears in this list."
+  :type '(repeat (choice (const :tag "Blocked" "blocked")
+                         (const :tag "Working" "working")
+                         (const :tag "Done" "done")
+                         (const :tag "Idle" "idle")
+                         (string :tag "Status")))
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
+
+(defcustom herdr-sanctum-sidebar-space-meta-function nil
+  "Optional function `(WS GIT-INFO MAX-PX)' formatting right-side space meta.
+When non-nil, called for each space row with the workspace alist WS,
+its Git info plist GIT-INFO (or nil), and an integer pixel budget MAX-PX.
+Should return a propertized string, or nil to omit right-side metadata.
+When nil, use the default compact/wide Git metadata formatter."
+  :type '(choice (const :tag "Default compact Git meta" nil)
+                 function)
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
+
+(defcustom herdr-sanctum-sidebar-footer-action nil
+  "Right-aligned action button in the `*sanctum-spaces*' status bar.
+- nil: show the default `Config' button (omitted when
+  `herdr-sanctum-config-file' is nil).
+- `none': hide the right-side footer button.
+- `(LABEL . ACTION)': render a clickable button with LABEL invoking
+  interactive command or zero-argument function ACTION."
+  :type '(choice (const :tag "Default Config button" nil)
+                 (const :tag "Hidden" none)
+                 (cons (string :tag "Label") (function :tag "Action")))
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
 
 (defcustom herdr-sanctum-config-file "~/.config/herdr/config.toml"
-  "Path to Herdr's configuration file opened from the sidebar status bar."
-  :type 'file
+  "Path to Herdr's configuration file opened from the sidebar status bar.
+Set to nil to hide the default `Config' button."
+  :type '(choice (const :tag "None (hide Config button)" nil)
+                 (file :tag "Config file"))
+  :group 'herdr-sanctum-sidebar
+  :set #'herdr-sanctum-sidebar--set-option)
+
+(defcustom herdr-sanctum-sidebar-change-hook nil
+  "Hook run when `*sanctum-spaces*' visibility changes."
+  :type 'hook
   :group 'herdr-sanctum-sidebar)
 
 (defvar herdr-sanctum-sidebar--enabled nil
@@ -92,6 +158,15 @@ Supported symbols are `spaces' and `agents'."
 
 (defvar herdr-sanctum-sidebar--git-refresh-timer nil
   "Zero-delay timer coalescing batched Git updates into one sidebar render.")
+
+(defvar-local herdr-sanctum-sidebar--focus-overlay nil
+  "Overlay highlighting an active row while `*sanctum-spaces*' has focus.")
+
+(defvar herdr-sanctum-sidebar--chevron-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'herdr-sanctum-sidebar-mouse-toggle-fold)
+    map)
+  "Overlay keymap for clickable workspace fold chevrons in `*sanctum-spaces*'.")
 
 (defun herdr-sanctum-sidebar-enabled-p ()
   "Return non-nil when the sidebar should be shown when opening Sanctum."
@@ -137,18 +212,37 @@ clears the manual override so future focus switches auto-expand/collapse."
   (seq-uniq (seq-filter (lambda (s) (memq s '(spaces agents)))
                         herdr-sanctum-sidebar-sections)))
 
-(defun herdr-sanctum-sidebar--space-git-meta (git-info tab-count)
-  "Format right-aligned Git metadata (or TAB-COUNT fallback) from GIT-INFO."
-  (let ((tabs (or tab-count 1)))
+(defun herdr-sanctum-sidebar--space-git-meta (git-info tab-count &optional width)
+  "Format right-aligned Git metadata (or TAB-COUNT fallback) from GIT-INFO.
+Optional WIDTH is the sidebar column width (defaulting to
+`herdr-sanctum-sidebar-width').  Widths above 34 columns expand the branch
+budget and show abbreviated branch alongside sync counters when both fit."
+  (let ((tabs (or tab-count 1))
+        (col-width (or width herdr-sanctum-sidebar-width 30)))
     (cond
      (git-info
-      (let ((has-sync (or (> (or (plist-get git-info :behind) 0) 0)
-                          (> (or (plist-get git-info :ahead) 0) 0))))
+      (let* ((wide-p (> col-width 34))
+             (budget (if wide-p
+                         (min 24 (+ 11 (max 0 (- col-width 34))))
+                       11))
+             (branch (or (plist-get git-info :branch) ""))
+             (dirty (or (plist-get git-info :dirty) 0))
+             (has-sync (or (> (or (plist-get git-info :behind) 0) 0)
+                           (> (or (plist-get git-info :ahead) 0) 0))))
         (if has-sync
-            (or (herdr-sanctum-format-git-sync git-info t) "")
-          (let* ((branch (or (plist-get git-info :branch) ""))
-                 (dirty (or (plist-get git-info :dirty) 0))
-                 (max-branch-width (if (> dirty 0) 12 14))
+            (let ((sync (or (herdr-sanctum-format-git-sync git-info t) "")))
+              (if (and wide-p (not (string-empty-p branch)))
+                  (let ((branch-budget (- budget (string-width sync) 1)))
+                    (if (>= branch-budget 4)
+                        (concat (propertize (herdr-sanctum-truncate branch branch-budget)
+                                            'face 'herdr-sanctum-sidebar-meta)
+                                (propertize " " 'face 'herdr-sanctum-sidebar-meta)
+                                sync)
+                      sync))
+                sync))
+          (let* ((max-branch-width (if (> dirty 0)
+                                       (max 4 (if wide-p (- budget 2) 10))
+                                     budget))
                  (short-branch (herdr-sanctum-truncate branch max-branch-width)))
             (if (not (string-empty-p short-branch))
                 (propertize (if (> dirty 0) (concat short-branch " •") short-branch)
@@ -288,7 +382,9 @@ of that line."
           (add-face-text-property t-start (1- (point)) (list :background sel-bg) t))
         (add-text-properties
          t-start (1- (point))
-         (list 'herdr-sanctum-item
+         (append
+          (when is-focused '(herdr-sanctum-active-row t))
+          (list 'herdr-sanctum-item
                (list :kind 'tab
                      :workspace-id ws-id
                      :tab-id tab-id
@@ -298,7 +394,7 @@ of that line."
                'mouse-face 'highlight
                'help-echo (format "%s / %s (%d pane%s)"
                                   ws-label tab-label pane-count
-                                  (if (= pane-count 1) "" "s")))))
+                                  (if (= pane-count 1) "" "s"))))))
       (cl-incf tab-idx))))
 
 (defun herdr-sanctum-sidebar--insert-workspace-row (ws ws-idx ws-count data width win sel-bg)
@@ -322,8 +418,24 @@ of that line."
          (bg-face (when ws-strong 'herdr-sanctum-sidebar-space-active))
          (active-bg (when ws-strong sel-bg))
          (badge (herdr-sanctum-space-badge ws-label ws-id))
+         (chevron-face (if active-bg
+                           (list 'herdr-sanctum-sidebar-meta
+                                 `(:background ,active-bg))
+                         'herdr-sanctum-sidebar-meta))
+         (chevron (if (> tab-count 0)
+                      (propertize (if expanded "▾" "▸")
+                                  'face chevron-face
+                                  'herdr-sanctum-chevron ws-id
+                                  'keymap herdr-sanctum-sidebar--chevron-keymap
+                                  'pointer 'hand)
+                    (propertize " " 'face (when active-bg `(:background ,active-bg)))))
+         (chev-gap (if (and (window-live-p win) (display-graphic-p (window-frame win)))
+                       (propertize " "
+                                   'display '(space :width (3))
+                                   'face (when active-bg `(:background ,active-bg)))
+                     " "))
          (wt-prefix (if linked-wt
-                        (propertize "↳ " 'face 'herdr-sanctum-sidebar-meta)
+                        (propertize "↳ " 'face chevron-face)
                       ""))
          (label-str (propertize ws-label
                                 'face (cond
@@ -332,9 +444,26 @@ of that line."
                                        (t 'herdr-sanctum-sidebar-space))))
          (ws-dir (herdr-sanctum-workspace-dir ws snapshot))
          (ws-git (and ws-dir (herdr-sanctum-git-info-for-dir ws-dir)))
-         (right (herdr-sanctum-sidebar--space-git-meta ws-git tab-count))
+         (meta-width (if (and (window-live-p win)
+                              (window-parameter win 'window-side))
+                         (max (window-total-width win)
+                              (or herdr-sanctum-sidebar-width 30))
+                       (or herdr-sanctum-sidebar-width 30)))
+         (meta-max-px (if (and (window-live-p win)
+                               (display-graphic-p (window-frame win)))
+                          (max 40 (/ (herdr-sanctum-usable-body-px win 80) 2))
+                        (max 8 (/ (* width
+                                     (frame-char-width
+                                      (and (window-live-p win) (window-frame win))))
+                                  2))))
+         (right (if (functionp herdr-sanctum-sidebar-space-meta-function)
+                    (let ((custom (funcall herdr-sanctum-sidebar-space-meta-function
+                                           ws ws-git meta-max-px)))
+                      (if (stringp custom) custom ""))
+                  (herdr-sanctum-sidebar--space-git-meta ws-git tab-count meta-width)))
          (left (concat (herdr-sanctum-row-accent ws-strong active-bg)
-                       wt-prefix badge (if (string-empty-p badge) "" " ") label-str))
+                       chevron chev-gap wt-prefix badge
+                       (if (string-empty-p badge) "" " ") label-str))
          (row (herdr-sanctum-format-row left right width win bg-face))
          (line-start (point)))
     (insert row (if ws-strong (propertize "\n" 'face bg-face) "\n"))
@@ -342,7 +471,9 @@ of that line."
       (add-face-text-property line-start (1- (point)) (list :background sel-bg) t))
     (add-text-properties
      line-start (1- (point))
-     (list 'herdr-sanctum-item
+     (append
+      (when ws-strong '(herdr-sanctum-active-row t))
+      (list 'herdr-sanctum-item
            (list :kind 'workspace
                  :workspace-id ws-id
                  :label ws-label
@@ -352,7 +483,7 @@ of that line."
            'help-echo (format "Space %s (%d tab%s%s; TAB to %s tabs)"
                               ws-label tab-count (if (= tab-count 1) "" "s")
                               (or (herdr-sanctum-sidebar--repos-tooltip ws-git) "")
-                              (if expanded "collapse" "expand"))))
+                              (if expanded "collapse" "expand")))))
     (when expanded
       (herdr-sanctum-sidebar--insert-workspace-tabs
        ws ws-tabs ws-active focused-tab width win sel-bg))))
@@ -384,8 +515,11 @@ When SHOW-HEADER is non-nil, prepend an inline Spaces section header."
            ws ws-idx ws-count data width win sel-bg)
           (cl-incf ws-idx)))))))
 
-(defun herdr-sanctum-sidebar--insert-agent-row (agent status data width win sel-bg)
-  "Insert a single AGENT row with STATUS using render DATA."
+(defun herdr-sanctum-sidebar--insert-agent-row
+    (agent status data width win sel-bg &optional primary-focus)
+  "Insert a single AGENT row with STATUS using render DATA.
+When PRIMARY-FOCUS is non-nil (Agents is the sole primary focus section),
+style the focused agent row with a full selection background."
   (let* ((pane-id (alist-get 'pane_id agent))
          (ws-id (alist-get 'workspace_id agent))
          (tab-id (alist-get 'tab_id agent))
@@ -401,14 +535,16 @@ When SHOW-HEADER is non-nil, prepend an inline Spaces section header."
                                (equal tab-label ws-label))
                      tab-label)))
          (is-focused (and pane-id (equal pane-id (plist-get data :focused-pane))))
+         (strong-focus (and is-focused primary-focus))
          (in-focused-ws (and (plist-get data :focused-ws)
                              (equal ws-id (plist-get data :focused-ws))))
-         (bg-face (when is-focused 'herdr-sanctum-sidebar-tab-active))
-         (active-bg (when is-focused sel-bg))
+         (bg-face (when strong-focus 'herdr-sanctum-sidebar-tab-active))
+         (active-bg (when strong-focus sel-bg))
          (badge (herdr-sanctum-agent-badge (alist-get 'agent agent) status active-bg))
-         (primary-face (if is-focused
-                           'herdr-sanctum-sidebar-tab-active
-                         'herdr-sanctum-sidebar-space))
+         (primary-face (cond
+                        (strong-focus 'herdr-sanctum-sidebar-tab-active)
+                        (is-focused 'herdr-sanctum-sidebar-space-expanded)
+                        (t 'herdr-sanctum-sidebar-space)))
          (title-str
           (if (and in-focused-ws detail)
               (propertize detail 'face primary-face)
@@ -423,12 +559,14 @@ When SHOW-HEADER is non-nil, prepend an inline Spaces section header."
          (left (concat (herdr-sanctum-row-accent is-focused active-bg) badge " " title-str))
          (row (herdr-sanctum-format-row left right width win bg-face))
          (a-start (point)))
-    (insert row (if is-focused (propertize "\n" 'face bg-face) "\n"))
-    (when (and is-focused sel-bg)
+    (insert row (if strong-focus (propertize "\n" 'face bg-face) "\n"))
+    (when (and strong-focus sel-bg)
       (add-face-text-property a-start (1- (point)) (list :background sel-bg) t))
     (add-text-properties
      a-start (1- (point))
-     (list 'herdr-sanctum-item
+     (append
+      (when strong-focus '(herdr-sanctum-active-row t))
+      (list 'herdr-sanctum-item
            (list :kind 'agent
                  :pane-id pane-id
                  :workspace-id ws-id
@@ -441,13 +579,23 @@ When SHOW-HEADER is non-nil, prepend an inline Spaces section header."
                                   (format " · %s" topic)
                                 "")
                               (or (alist-get 'agent agent) "agent")
-                              status)))))
+                              status))))))
 
-(defun herdr-sanctum-sidebar--render-agents (data width win sel-bg &optional show-header)
+(defun herdr-sanctum-sidebar--render-agents
+    (data width win sel-bg &optional show-header primary-focus)
   "Render the Agents section from DATA into the current buffer.
 When SHOW-HEADER is non-nil, prepend an inline Agents section header."
-  (let ((agent-groups (plist-get data :agent-groups))
-        (total-agents (length (alist-get 'agents (plist-get data :snapshot)))))
+  (let* ((all-groups (plist-get data :agent-groups))
+         (allowed (seq-uniq
+                   (if herdr-sanctum-sidebar-show-idle-agents
+                       herdr-sanctum-sidebar-agent-statuses
+                     (seq-remove (lambda (s) (equal s "idle"))
+                                 herdr-sanctum-sidebar-agent-statuses))))
+         (agent-groups (delq nil
+                             (mapcar (lambda (status)
+                                       (assoc status all-groups))
+                                     allowed)))
+         (total-agents (cl-loop for g in agent-groups sum (length (cdr g)))))
     (when show-header
       (insert (herdr-sanctum-format-row
                (propertize "Agents" 'face 'herdr-sanctum-sidebar-header)
@@ -469,7 +617,8 @@ When SHOW-HEADER is non-nil, prepend an inline Agents section header."
                          (_         'herdr-sanctum-sidebar-meta))))
           (insert (propertize g-label 'face g-face) "\n")
           (dolist (agent items)
-            (herdr-sanctum-sidebar--insert-agent-row agent status data width win sel-bg)))))))
+            (herdr-sanctum-sidebar--insert-agent-row
+             agent status data width win sel-bg primary-focus)))))))
 
 (defun herdr-sanctum-sidebar--update-chrome (&optional win sections space-count agent-count)
   "Recompute buffer-local `header-line-format' and `mode-line-format'.
@@ -501,27 +650,43 @@ default to the counts in the current snapshot."
                      ""))
          (status-text (cond
                        ((and has-spaces has-agents (eq (car secs) 'agents))
-                        (format " %d agent%s · %d space%s"
+                        (format "%d agent%s · %d space%s"
                                 n-agents (if (= n-agents 1) "" "s")
                                 n-spaces (if (= n-spaces 1) "" "s")))
+                       ((and has-spaces has-agents (> n-agents 0))
+                        (format "%d space%s · %d agent%s"
+                                n-spaces (if (= n-spaces 1) "" "s")
+                                n-agents (if (= n-agents 1) "" "s")))
                        (has-spaces
-                        (format " %d space%s" n-spaces (if (= n-spaces 1) "" "s")))
+                        (format "%d space%s" n-spaces (if (= n-spaces 1) "" "s")))
                        (has-agents
-                        (format " %d agent%s" n-agents (if (= n-agents 1) "" "s")))
-                       (t " ")))
+                        (format "%d agent%s" n-agents (if (= n-agents 1) "" "s")))
+                       (t "")))
          (st-left (propertize status-text 'face 'herdr-sanctum-status-bar))
-         (st-right (concat
-                    (herdr-sanctum-make-chrome-button
-                     "Config"
-                     'mode-line
-                     #'herdr-sanctum-sidebar-open-config
-                     'herdr-sanctum-status-bar
-                     (format "Open %s" herdr-sanctum-config-file))
-                    (propertize " " 'face 'herdr-sanctum-status-bar))))
+         (st-right
+          (pcase herdr-sanctum-sidebar-footer-action
+            ('none "")
+            (`(,(and (pred stringp) label) . ,(and (pred functionp) fn))
+             (herdr-sanctum-make-chrome-button
+              label
+              'mode-line
+              fn
+              'herdr-sanctum-status-bar
+              (if (symbolp fn) (format "Run `%s'" fn) label)))
+            (_
+             (if (and (stringp herdr-sanctum-config-file)
+                      (not (string-empty-p herdr-sanctum-config-file)))
+                 (herdr-sanctum-make-chrome-button
+                  "Config"
+                  'mode-line
+                  #'herdr-sanctum-sidebar-open-config
+                  'herdr-sanctum-status-bar
+                  (format "Open %s (,)" herdr-sanctum-config-file))
+               "")))))
     (setq-local header-line-format
                 (herdr-sanctum-format-header-line hl-left hl-right w)
                 mode-line-format
-                (list st-left 'mode-line-format-right-align st-right))
+                (herdr-sanctum-format-status-bar st-left st-right w))
     (force-mode-line-update)))
 
 (defun herdr-sanctum-sidebar--render (&optional win)
@@ -559,7 +724,9 @@ default to the counts in the current snapshot."
                     ('spaces (herdr-sanctum-sidebar--render-spaces
                               data width win sel-bg (not (null prev-section))))
                     ('agents (herdr-sanctum-sidebar--render-agents
-                              data width win sel-bg (> (length sections) 1))))
+                              data width win sel-bg
+                              (> (length sections) 1)
+                              (not (memq 'spaces sections)))))
                   (setq prev-section section)))))))
     (when (plist-get data :snapshot)
       (let ((ws-labels (plist-get data :ws-labels))
@@ -591,7 +758,8 @@ default to the counts in the current snapshot."
               ('agent (plist-get item :pane-id))
               ('tab (plist-get item :tab-id))
               (_ (plist-get item :workspace-id))))))
-       fallback))))
+       fallback))
+    (herdr-sanctum-sidebar--update-focus-overlay)))
 
 (defun herdr-sanctum-sidebar-refresh (&rest _)
   "Re-render `*sanctum-spaces*' when visible, or defer until shown."
@@ -671,6 +839,19 @@ failure."
   (interactive)
   (herdr-sanctum-sidebar--step-space -1))
 
+(defun herdr-sanctum-sidebar--toggle-workspace-fold (ws-id &optional from-tab win)
+  "Toggle expanded tab tree for workspace WS-ID and re-render `*sanctum-spaces*'.
+When FROM-TAB is non-nil and collapsing, move point to WS-ID's workspace row.
+Optional WIN specifies the sidebar window to render."
+  (when ws-id
+    (let ((now-expanded (not (herdr-sanctum-sidebar--space-expanded-p ws-id))))
+      (herdr-sanctum-sidebar--set-space-expanded ws-id now-expanded)
+      (herdr-sanctum-sidebar--render win)
+      (when (and (not now-expanded) from-tab)
+        (when-let* ((pos (herdr-sanctum-sidebar--find-item-pos 'workspace ws-id)))
+          (goto-char pos)
+          (beginning-of-line))))))
+
 (defun herdr-sanctum-sidebar-toggle-fold ()
   "Toggle expanded tab tree for the space at point (or parent space of a tab)."
   (interactive)
@@ -678,14 +859,21 @@ failure."
               (kind (plist-get item :kind))
               ((memq kind '(workspace tab)))
               (ws-id (plist-get item :workspace-id)))
-    (let ((now-expanded (not (herdr-sanctum-sidebar--space-expanded-p ws-id))))
-      (herdr-sanctum-sidebar--set-space-expanded ws-id now-expanded)
-      (herdr-sanctum-sidebar--render)
-      (when (and (not now-expanded)
-                 (eq kind 'tab))
-        (when-let* ((pos (herdr-sanctum-sidebar--find-item-pos 'workspace ws-id)))
-          (goto-char pos)
-          (beginning-of-line))))))
+    (herdr-sanctum-sidebar--toggle-workspace-fold ws-id (eq kind 'tab))))
+
+(defun herdr-sanctum-sidebar-mouse-toggle-fold (event)
+  "Toggle workspace fold for the chevron clicked by mouse EVENT."
+  (interactive "e")
+  (let* ((end (event-end event))
+         (win (posn-window end))
+         (pos (posn-point end)))
+    (when (and (window-live-p win) (integerp pos))
+      (with-current-buffer (window-buffer win)
+        (when-let* ((ws-id (or (get-text-property pos 'herdr-sanctum-chevron)
+                               (let ((item (herdr-sanctum-sidebar--item-at pos)))
+                                 (when (eq (plist-get item :kind) 'workspace)
+                                   (plist-get item :workspace-id))))))
+          (herdr-sanctum-sidebar--toggle-workspace-fold ws-id nil win))))))
 
 (defun herdr-sanctum-sidebar-toggle-fold-all ()
   "Collapse all spaces when any is expanded, otherwise expand all."
@@ -776,7 +964,10 @@ failure."
       (_
        (setq dispatched nil)))
     (when (and dispatched focus-terminal)
-      (herdr-sanctum-focus-terminal))))
+      (if (get-buffer-window herdr-sanctum-buffer-name (selected-frame))
+          (herdr-sanctum-focus-terminal)
+        (when (fboundp 'herdr-sanctum)
+          (herdr-sanctum '(4)))))))
 
 (defun herdr-sanctum-sidebar-activate ()
   "Focus the space, tab, or agent at point and return focus to `*sanctum*'."
@@ -798,8 +989,10 @@ failure."
          (pos (posn-point end)))
     (when (and (window-live-p win) (integerp pos))
       (with-current-buffer (window-buffer win)
-        (when-let* ((item (herdr-sanctum-sidebar--item-at pos)))
-          (herdr-sanctum-sidebar-focus-item item t))))))
+        (if-let* ((ws-id (get-text-property pos 'herdr-sanctum-chevron)))
+            (herdr-sanctum-sidebar--toggle-workspace-fold ws-id nil win)
+          (when-let* ((item (herdr-sanctum-sidebar--item-at pos)))
+            (herdr-sanctum-sidebar-focus-item item t)))))))
 
 (defun herdr-sanctum-sidebar-new-tab ()
   "Create a new tab in the space at point (or active space) and focus it."
@@ -845,12 +1038,17 @@ failure."
                                     (label . ,new))))))))
 
 (defun herdr-sanctum-sidebar-close ()
-  "Close the tab or space at point after confirmation."
+  "Close the tab, space, or agent pane at point after confirmation."
   (interactive)
   (when-let* ((item (herdr-sanctum-sidebar--item-at)))
     (let ((kind (plist-get item :kind))
           (label (or (plist-get item :label) "")))
       (pcase kind
+        ('agent
+         (when-let* ((pane-id (plist-get item :pane-id)))
+           (when (y-or-n-p (format "Close agent pane `%s'? "
+                                   (if (string-empty-p label) pane-id label)))
+             (herdr-sanctum-rpc-call "pane.close" `((pane_id . ,pane-id))))))
         ('tab
          (when (y-or-n-p (format "Close tab `%s'? " label))
            (herdr-sanctum-rpc-call "tab.close" `((tab_id . ,(plist-get item :tab-id))))))
@@ -906,9 +1104,79 @@ failure."
 (defun herdr-sanctum-sidebar-open-config ()
   "Open `herdr-sanctum-config-file' outside Sanctum."
   (interactive)
-  (herdr-sanctum-open-outside
-   (lambda ()
-     (find-file (expand-file-name herdr-sanctum-config-file)))))
+  (unless (and (stringp herdr-sanctum-config-file)
+               (not (string-empty-p herdr-sanctum-config-file)))
+    (user-error "No Herdr config file configured (`herdr-sanctum-config-file' is nil)"))
+  (let ((path (expand-file-name herdr-sanctum-config-file))
+        (opener (or (let ((fn (bound-and-true-p herdr-sanctum-open-file-function)))
+                      (and (functionp fn) fn))
+                    #'find-file)))
+    (herdr-sanctum-open-outside
+     (lambda ()
+       (herdr-sanctum-invoke-command-or-fn opener path)))))
+
+(defun herdr-sanctum-sidebar-quit ()
+  "Leave `*sanctum-spaces*' for `*sanctum*' or another non-side window.
+If `*sanctum*' is visible on the current frame, focus it.  Otherwise
+select the most recently used non-side window on the current frame, or
+toggle the sidebar off when it is the sole window."
+  (interactive)
+  (let ((cur (selected-window)))
+    (cond
+     ((when-let* ((term-win (get-buffer-window herdr-sanctum-buffer-name
+                                               (selected-frame))))
+        (select-window term-win)
+        t))
+     ((when-let* ((candidates (seq-filter
+                               (lambda (w)
+                                 (and (not (eq w cur))
+                                      (not (window-parameter w 'window-side))))
+                               (window-list (selected-frame) 'no-minibuf)))
+                  (other (car (sort candidates
+                                    (lambda (a b)
+                                      (> (window-use-time a)
+                                         (window-use-time b)))))))
+        (select-window other)
+        t))
+     (t
+      (herdr-sanctum-sidebar-toggle)))))
+
+(defun herdr-sanctum-sidebar-help ()
+  "Echo a concise summary of `*sanctum-spaces*' keybindings."
+  (interactive)
+  (message "Spaces: RET open · o peek · TAB/h/l fold · j/k move · a agent · / jump · c/C new · r rename · d close · , config · q back · Q hide"))
+
+(defun herdr-sanctum-sidebar--update-focus-overlay (&optional _frame)
+  "Highlight an active row with `herdr-sanctum-panel-focus-active' when focused."
+  (when-let* ((buf (get-buffer herdr-sanctum-sidebar-buffer-name)))
+    (with-current-buffer buf
+      (let* ((sel-win (selected-window))
+             (focused (and (window-live-p sel-win)
+                           (eq (window-buffer sel-win) buf)))
+             (pt (and focused (window-point sel-win)))
+             (active-row (and pt
+                              (save-excursion
+                                (goto-char pt)
+                                (get-text-property (line-beginning-position)
+                                                   'herdr-sanctum-active-row)))))
+        (if active-row
+            (save-excursion
+              (goto-char pt)
+              (let ((beg (line-beginning-position))
+                    (end (min (point-max) (1+ (line-end-position)))))
+                (if (overlayp herdr-sanctum-sidebar--focus-overlay)
+                    (move-overlay herdr-sanctum-sidebar--focus-overlay beg end buf)
+                  (setq herdr-sanctum-sidebar--focus-overlay
+                        (make-overlay beg end buf)))
+                (overlay-put herdr-sanctum-sidebar--focus-overlay 'priority 100)
+                (overlay-put herdr-sanctum-sidebar--focus-overlay 'face
+                             'herdr-sanctum-panel-focus-active)))
+          (when (overlayp herdr-sanctum-sidebar--focus-overlay)
+            (delete-overlay herdr-sanctum-sidebar--focus-overlay)))
+        (when (bound-and-true-p hl-line-mode)
+          (if focused
+              (hl-line-highlight)
+            (hl-line-unhighlight)))))))
 
 ;;; Major Mode & Lifecycle
 
@@ -960,9 +1228,12 @@ failure."
   "7" #'herdr-sanctum-sidebar-select-space-by-digit
   "8" #'herdr-sanctum-sidebar-select-space-by-digit
   "9" #'herdr-sanctum-sidebar-select-space-by-digit
+  "," #'herdr-sanctum-sidebar-open-config
   "g" #'herdr-sanctum-refresh-state
-  "q" #'herdr-sanctum-focus-terminal
-  "<escape>" #'herdr-sanctum-focus-terminal)
+  "?" #'herdr-sanctum-sidebar-help
+  "q" #'herdr-sanctum-sidebar-quit
+  "<escape>" #'herdr-sanctum-sidebar-quit
+  "Q" #'herdr-sanctum-sidebar-toggle)
 
 (define-derived-mode herdr-sanctum-sidebar-mode special-mode "Sanctum-Spaces"
   "Major mode for the persistent Herdr Sanctum sidebar."
@@ -972,33 +1243,65 @@ failure."
    nil
    (lambda ()
      (when-let* ((snap (herdr-sanctum-snapshot)))
-       (herdr-sanctum-git-refresh-snapshot snap)))))
+       (herdr-sanctum-git-refresh-snapshot snap))))
+  (add-hook 'post-command-hook #'herdr-sanctum-sidebar--update-focus-overlay nil t)
+  (add-hook 'window-selection-change-functions
+            #'herdr-sanctum-sidebar--update-focus-overlay nil t))
+
+(herdr-sanctum-configure-evil-mode 'herdr-sanctum-sidebar-mode)
 
 ;;;###autoload
 (defun herdr-sanctum-sidebar-show (&optional select)
   "Ensure `*sanctum-spaces*' is shown in its side-window.
 With SELECT non-nil, move focus to the sidebar window."
   (interactive "P")
-  (herdr-sanctum-show-panel
-   herdr-sanctum-sidebar-buffer-name
-   #'herdr-sanctum-sidebar-mode
-   herdr-sanctum-sidebar-side
-   herdr-sanctum-sidebar-width
-   #'herdr-sanctum-sidebar--render
-   select
-   0))
+  (prog1
+      (herdr-sanctum-show-panel
+       herdr-sanctum-sidebar-buffer-name
+       #'herdr-sanctum-sidebar-mode
+       herdr-sanctum-sidebar-side
+       herdr-sanctum-sidebar-width
+       #'herdr-sanctum-sidebar--render
+       select
+       0)
+    (run-hooks 'herdr-sanctum-sidebar-change-hook)))
+
+(defun herdr-sanctum-sidebar-collapse ()
+  "Collapse `*sanctum-spaces*' on the current frame and mark it disabled."
+  (setq herdr-sanctum-sidebar--enabled 'off)
+  (when-let* ((buf (get-buffer herdr-sanctum-sidebar-buffer-name))
+              (win (get-buffer-window buf (selected-frame)))
+              ((window-live-p win))
+              ((eq (window-deletable-p win) t)))
+    (delete-window win))
+  (run-hooks 'herdr-sanctum-sidebar-change-hook)
+  (force-mode-line-update t))
 
 ;;;###autoload
 (defun herdr-sanctum-sidebar-toggle ()
   "Toggle the `*sanctum-spaces*' side-window."
   (interactive)
-  (herdr-sanctum-toggle-panel
-   herdr-sanctum-sidebar-buffer-name
-   #'herdr-sanctum-sidebar-show
-   (lambda (enabled)
-     (setq herdr-sanctum-sidebar--enabled (if enabled 'on 'off)))
-   nil
-   #'herdr-sanctum-terminal-resize))
+  (let ((shown nil))
+    (herdr-sanctum-toggle-panel
+     herdr-sanctum-sidebar-buffer-name
+     (lambda ()
+       (herdr-sanctum-maybe-collapse-opposite-panel
+        herdr-sanctum-sidebar-side
+        herdr-sanctum-sidebar-width
+        herdr-sanctum-drawer-buffer-name
+        (bound-and-true-p herdr-sanctum-drawer-side)
+        (lambda ()
+          (when (fboundp 'herdr-sanctum-drawer-collapse)
+            (herdr-sanctum-drawer-collapse))))
+       (prog1 (herdr-sanctum-sidebar-show)
+         (setq shown t)))
+     (lambda (enabled)
+       (setq herdr-sanctum-sidebar--enabled (if enabled 'on 'off)))
+     nil
+     (lambda ()
+       (herdr-sanctum-terminal-resize)
+       (unless shown
+         (run-hooks 'herdr-sanctum-sidebar-change-hook))))))
 
 (defun herdr-sanctum-sidebar--cleanup ()
   "Delete sidebar windows and kill `*sanctum-spaces*' on disconnect."

@@ -31,6 +31,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'subr-x)
 (require 'herdr-sanctum-rpc)
 
@@ -56,9 +57,61 @@ When nil, use `default-input-method' (for example \"rime\")."
   :type 'boolean
   :group 'herdr-sanctum-ime)
 
+(defcustom herdr-sanctum-ime-default-function nil
+  "Optional function `(PANE SNAPSHOT)' resolving default IME behavior per pane.
+Called before falling back to `herdr-sanctum-ime-agent-default' and
+`herdr-sanctum-ime-shell-default'.  Supported return values:
+  `on' or t      -- enable the configured input method
+  `off' or nil   -- disable the input method
+  non-empty string -- activate that specific input method for this pane
+  `default'      -- fall back to `herdr-sanctum-ime-agent-default' /
+                    `herdr-sanctum-ime-shell-default'."
+  :type '(choice (const :tag "Use agent/shell defaults" nil)
+                 function)
+  :group 'herdr-sanctum-ime)
+
+(defcustom herdr-sanctum-ime-activate-function nil
+  "Optional external OS IME activation callback called with `(METHOD)'.
+When both this and `herdr-sanctum-ime-deactivate-function' are non-nil,
+invoke them instead of Emacs's `activate-input-method' and
+`deactivate-input-method' (for integrating `sis', `macism', `fcitx5-remote',
+and similar OS-level IME controllers)."
+  :type '(choice (const :tag "Use Emacs input method" nil)
+                 function)
+  :group 'herdr-sanctum-ime)
+
+(defcustom herdr-sanctum-ime-deactivate-function nil
+  "Optional external OS IME deactivation callback called with no arguments.
+Used together with `herdr-sanctum-ime-activate-function'."
+  :type '(choice (const :tag "Use Emacs input method" nil)
+                 function)
+  :group 'herdr-sanctum-ime)
+
+(defcustom herdr-sanctum-ime-active-p-function nil
+  "Optional zero-argument predicate returning non-nil when OS IME is active.
+When nil and external activate/deactivate callbacks are configured,
+`herdr-sanctum-ime--external-active' tracks the last synced boolean state."
+  :type '(choice (const :tag "Track synced state" nil)
+                 function)
+  :group 'herdr-sanctum-ime)
+
+(defcustom herdr-sanctum-ime-change-hook nil
+  "Hook run whenever Sanctum IME state changes.
+Fired when `herdr-sanctum-ime-mode' toggles, when `herdr-sanctum-ime-sync-pane'
+switches state, or when Emacs's input method activate/deactivate hook fires
+inside `*sanctum*'."
+  :type 'hook
+  :group 'herdr-sanctum-ime)
+
 (defvar herdr-sanctum-ime--panes (make-hash-table :test #'equal)
   "Map `pane_id' -> `(KIND . PREF)' tracked for `*sanctum*' IME sync.
 KIND is `agent', `shell', or nil; PREF is `on', `off', or nil.")
+
+(defvar herdr-sanctum-ime--pane-data (make-hash-table :test #'equal)
+  "Map `pane_id' -> latest Herdr pane alist for default IME resolution.")
+
+(defvar herdr-sanctum-ime--last-snapshot nil
+  "Latest Herdr snapshot alist seen by `herdr-sanctum-ime'.")
 
 (defvar herdr-sanctum-ime--focused-pane-id nil
   "Herdr `pane_id' currently mirrored by `*sanctum*' input method state.")
@@ -66,27 +119,116 @@ KIND is `agent', `shell', or nil; PREF is `on', `off', or nil.")
 (defvar herdr-sanctum-ime--syncing nil
   "Non-nil while `herdr-sanctum-ime-sync-pane' is switching input method.")
 
+(defvar herdr-sanctum-ime--deactivating nil
+  "Non-nil while `input-method-deactivate-hook' is firing in `*sanctum*'.")
+
+(defvar herdr-sanctum-ime--external-active nil
+  "Last synced boolean active state for external OS IME callbacks.")
+
+(defvar herdr-sanctum-ime--last-method nil
+  "Last input method name activated by `herdr-sanctum-ime'.")
+
 (defun herdr-sanctum-ime--method ()
   "Return the resolved input method name string, or nil."
   (or herdr-sanctum-ime-input-method default-input-method))
 
-(defun herdr-sanctum-ime--available-p ()
-  "Return non-nil when automatic per-pane IME switching should run."
-  (let ((method (herdr-sanctum-ime--method)))
-    (and (bound-and-true-p herdr-sanctum-ime-mode)
-         (stringp method)
-         (not (string-empty-p method))
-         (assoc method input-method-alist))))
+(defun herdr-sanctum-ime--external-p ()
+  "Return non-nil when external OS IME callbacks are configured."
+  (and (functionp herdr-sanctum-ime-activate-function)
+       (functionp herdr-sanctum-ime-deactivate-function)))
+
+(defun herdr-sanctum-ime--external-active-p ()
+  "Return non-nil when the external OS IME is currently active."
+  (if (functionp herdr-sanctum-ime-active-p-function)
+      (and (condition-case err
+               (funcall herdr-sanctum-ime-active-p-function)
+             (error
+              (message "Sanctum IME active check failed: %s"
+                       (error-message-string err))
+              herdr-sanctum-ime--external-active))
+           t)
+    (and herdr-sanctum-ime--external-active t)))
+
+(defun herdr-sanctum-ime--available-p (&optional method)
+  "Return non-nil when automatic per-pane IME switching should run.
+When optional METHOD is non-nil, validate it instead of the default method."
+  (and (bound-and-true-p herdr-sanctum-ime-mode)
+       (or (herdr-sanctum-ime--external-p)
+           (let ((m (or method (herdr-sanctum-ime--method))))
+             (and (stringp m)
+                  (not (string-empty-p m))
+                  (assoc m input-method-alist))))))
+
+(defun herdr-sanctum-ime--pane-for-id (pane-id snapshot)
+  "Return the Herdr pane alist for PANE-ID from cache or SNAPSHOT."
+  (or (gethash pane-id herdr-sanctum-ime--pane-data)
+      (cl-find-if (lambda (p) (equal (alist-get 'pane_id p) pane-id))
+                  (alist-get 'panes snapshot))))
+
+(defun herdr-sanctum-ime--resolve-default (pane-id entry)
+  "Return `(WANT-ON . METHOD)' default IME specification for PANE-ID.
+ENTRY is the `(KIND . PREF)' cons stored in `herdr-sanctum-ime--panes'."
+  (let* ((global-method (herdr-sanctum-ime--method))
+         (is-agent (eq (car entry) 'agent))
+         (fallback (cons (and (if is-agent
+                                  herdr-sanctum-ime-agent-default
+                                herdr-sanctum-ime-shell-default)
+                              t)
+                         global-method)))
+    (if (functionp herdr-sanctum-ime-default-function)
+        (let* ((snapshot (or herdr-sanctum-ime--last-snapshot
+                             (herdr-sanctum-snapshot)))
+               (pane (herdr-sanctum-ime--pane-for-id pane-id snapshot))
+               (res (funcall herdr-sanctum-ime-default-function pane snapshot)))
+          (cond
+           ((eq res 'default) fallback)
+           ((or (eq res 'on) (eq res t)) (cons t global-method))
+           ((or (eq res 'off) (null res)) (cons nil global-method))
+           ((and (stringp res) (not (string-empty-p res))) (cons t res))
+           (t fallback)))
+      fallback)))
+
+(defun herdr-sanctum-ime-indicator-string (&optional buffer)
+  "Return a compact IME status indicator string, or nil when disabled.
+When `herdr-sanctum-ime-mode' is enabled, returns `current-input-method-title'
+when an Emacs input method is active in BUFFER (defaulting to `*sanctum*'),
+\"IME\" when an external OS IME is active, or \"EN\" when inactive."
+  (when (bound-and-true-p herdr-sanctum-ime-mode)
+    (if (herdr-sanctum-ime--external-p)
+        (if (herdr-sanctum-ime--external-active-p) "IME" "EN")
+      (let ((buf (if buffer
+                     (get-buffer buffer)
+                   (or (get-buffer herdr-sanctum-buffer-name)
+                       (current-buffer)))))
+        (if (and (buffer-live-p buf)
+                 (not (and herdr-sanctum-ime--deactivating
+                           (eq buf (current-buffer))))
+                 (buffer-local-value 'current-input-method buf))
+            (let ((title (buffer-local-value 'current-input-method-title buf)))
+              (if (and (stringp title) (not (string-empty-p title)))
+                  title
+                "IME"))
+          "EN")))))
 
 (defun herdr-sanctum-ime--record-pref (pref)
   "Remember manual IME PREF (`on' or `off') for the focused Herdr pane."
   (when (and (not herdr-sanctum-ime--syncing)
-             herdr-sanctum-ime--focused-pane-id
-             (equal (buffer-name) herdr-sanctum-buffer-name)
-             (equal current-input-method (herdr-sanctum-ime--method)))
-    (let* ((pane-id herdr-sanctum-ime--focused-pane-id)
-           (entry (gethash pane-id herdr-sanctum-ime--panes)))
-      (puthash pane-id (cons (car entry) pref) herdr-sanctum-ime--panes))))
+             (equal (buffer-name) herdr-sanctum-buffer-name))
+    (when (and (not (herdr-sanctum-ime--external-p))
+               herdr-sanctum-ime--focused-pane-id
+               current-input-method)
+      (let* ((pane-id herdr-sanctum-ime--focused-pane-id)
+             (entry (gethash pane-id herdr-sanctum-ime--panes))
+             (pane-method (cdr (herdr-sanctum-ime--resolve-default pane-id entry))))
+        (when (or (equal current-input-method pane-method)
+                  (equal current-input-method (herdr-sanctum-ime--method))
+                  (and herdr-sanctum-ime--last-method
+                       (equal current-input-method herdr-sanctum-ime--last-method)))
+          (puthash pane-id (cons (car entry) pref) herdr-sanctum-ime--panes)
+          (setq herdr-sanctum-ime--last-method
+                (when (eq pref 'on) current-input-method)))))
+    (let ((herdr-sanctum-ime--deactivating (eq pref 'off)))
+      (run-hooks 'herdr-sanctum-ime-change-hook))))
 
 (defun herdr-sanctum-ime--record-activate ()
   "Remember manual IME activation for the focused Herdr pane."
@@ -118,52 +260,99 @@ Clear any manual override when the pane transitions between shell and agent."
       (puthash pane-id (cons kind pref) herdr-sanctum-ime--panes))))
 
 (defun herdr-sanctum-ime-sync-pane (pane-id)
-  "Sync `*sanctum*' input method to PANE-ID's remembered or default preference."
+  "Sync `*sanctum*' input method to PANE-ID's remembered or default preference.
+Return non-nil when input method state switched."
   (if (not (stringp pane-id))
-      (setq herdr-sanctum-ime--focused-pane-id nil)
+      (progn
+        (setq herdr-sanctum-ime--focused-pane-id nil)
+        nil)
     (setq herdr-sanctum-ime--focused-pane-id pane-id)
-    (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
-      (with-current-buffer buf
-        (when (herdr-sanctum-ime--available-p)
-          (let* ((method (herdr-sanctum-ime--method))
+    (when (bound-and-true-p herdr-sanctum-ime-mode)
+      (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
+        (with-current-buffer buf
+          (let* ((external (herdr-sanctum-ime--external-p))
                  (entry (gethash pane-id herdr-sanctum-ime--panes))
-                 (is-agent (eq (car entry) 'agent))
                  (pref (cdr entry))
-                 (want-on (if pref
-                              (eq pref 'on)
-                            (if is-agent
-                                herdr-sanctum-ime-agent-default
-                              herdr-sanctum-ime-shell-default)))
-                 (is-on (equal current-input-method method)))
-            (when (and herdr-sanctum-ime-input-method
-                       (not (equal default-input-method method)))
-              (setq-local default-input-method method))
-            (unless (eq want-on is-on)
-              (condition-case err
-                  (let ((herdr-sanctum-ime--syncing t))
-                    (if want-on
-                        (activate-input-method method)
-                      (deactivate-input-method)))
-                (error
-                 (message "Sanctum IME sync failed: %s" (error-message-string err))))
-              (force-mode-line-update))))))))
+                 (default-spec (herdr-sanctum-ime--resolve-default pane-id entry))
+                 (target-method (cdr default-spec))
+                 (want-on (and (if pref (eq pref 'on) (car default-spec)) t))
+                 (changed nil))
+            (cond
+             (external
+              (let* ((is-on (herdr-sanctum-ime--external-active-p))
+                     (need-switch
+                      (or (not (eq want-on is-on))
+                          (and want-on
+                               (stringp target-method)
+                               (not (string-empty-p target-method))
+                               (not (equal target-method
+                                           herdr-sanctum-ime--last-method))))))
+                (when need-switch
+                  (condition-case err
+                      (let ((herdr-sanctum-ime--syncing t))
+                        (if want-on
+                            (funcall herdr-sanctum-ime-activate-function target-method)
+                          (funcall herdr-sanctum-ime-deactivate-function))
+                        (setq herdr-sanctum-ime--external-active want-on
+                              herdr-sanctum-ime--last-method (when want-on target-method)
+                              changed t))
+                    (error
+                     (message "Sanctum IME sync failed: %s"
+                              (error-message-string err)))))))
+             ((or (herdr-sanctum-ime--available-p target-method)
+                  (and (not want-on)
+                       current-input-method
+                       (or (equal current-input-method herdr-sanctum-ime--last-method)
+                           (functionp herdr-sanctum-ime-default-function))))
+              (when (and herdr-sanctum-ime-input-method
+                         (stringp target-method)
+                         (not (string-empty-p target-method))
+                         (not (equal default-input-method target-method)))
+                (setq-local default-input-method target-method))
+              (let ((is-on (if want-on
+                               (equal current-input-method target-method)
+                             (and current-input-method
+                                  (or (equal current-input-method target-method)
+                                      (equal current-input-method
+                                             herdr-sanctum-ime--last-method)
+                                      (functionp herdr-sanctum-ime-default-function))
+                                  t))))
+                (unless (eq want-on is-on)
+                  (condition-case err
+                      (let ((herdr-sanctum-ime--syncing t))
+                        (if want-on
+                            (activate-input-method target-method)
+                          (deactivate-input-method))
+                        (setq herdr-sanctum-ime--last-method (when want-on target-method)
+                              changed t))
+                    (error
+                     (message "Sanctum IME sync failed: %s"
+                              (error-message-string err))))))))
+            (when changed
+              (force-mode-line-update)
+              (run-hooks 'herdr-sanctum-ime-change-hook))
+            changed))))))
 
 (defun herdr-sanctum-ime--on-snapshot (snapshot)
-  "Reconcile tracked pane kinds from SNAPSHOT, prune closed panes, and sync focus."
+  "Reconcile tracked pane kinds from SNAPSHOT, prune closed panes, and sync focus.
+Return non-nil when input method state switched."
+  (setq herdr-sanctum-ime--last-snapshot snapshot)
   (let ((panes (alist-get 'panes snapshot))
-        (live (make-hash-table :test #'equal))
-        stale)
+        (live (make-hash-table :test #'equal)))
     (dolist (pane panes)
       (when-let* ((pane-id (alist-get 'pane_id pane)))
         (puthash pane-id t live)
+        (puthash pane-id pane herdr-sanctum-ime--pane-data)
         (herdr-sanctum-ime--update-pane-kind
          pane-id (herdr-sanctum-ime--pane-kind pane))))
-    (maphash (lambda (pane-id _v)
-               (unless (gethash pane-id live)
-                 (push pane-id stale)))
-             herdr-sanctum-ime--panes)
-    (dolist (pane-id stale)
-      (remhash pane-id herdr-sanctum-ime--panes))
+    (dolist (tbl (list herdr-sanctum-ime--panes herdr-sanctum-ime--pane-data))
+      (let (stale)
+        (maphash (lambda (pane-id _v)
+                   (unless (gethash pane-id live)
+                     (push pane-id stale)))
+                 tbl)
+        (dolist (pane-id stale)
+          (remhash pane-id tbl))))
     (herdr-sanctum-ime-sync-pane (alist-get 'focused_pane_id snapshot))))
 
 (defun herdr-sanctum-ime--on-event (kind data)
@@ -175,6 +364,7 @@ Clear any manual override when the pane transitions between shell and agent."
     ("pane_created"
      (when-let* ((pane (alist-get 'pane data))
                  (pane-id (alist-get 'pane_id pane)))
+       (puthash pane-id pane herdr-sanctum-ime--pane-data)
        (herdr-sanctum-ime--update-pane-kind
         pane-id (herdr-sanctum-ime--pane-kind pane))))
     ("pane_agent_detected"
@@ -185,13 +375,23 @@ Clear any manual override when the pane transitions between shell and agent."
                              (not (string-empty-p agent))
                              (not released))
                         'agent
-                      'shell)))
+                      'shell))
+              (existing (gethash pane-id herdr-sanctum-ime--pane-data))
+              (updated (assq-delete-all
+                        'display_agent
+                        (assq-delete-all 'agent (copy-alist existing)))))
+         (unless (alist-get 'pane_id updated)
+           (push (cons 'pane_id pane-id) updated))
+         (when (eq kind 'agent)
+           (push (cons 'agent agent) updated))
+         (puthash pane-id updated herdr-sanctum-ime--pane-data)
          (herdr-sanctum-ime--update-pane-kind pane-id kind)
          (when (equal pane-id herdr-sanctum-ime--focused-pane-id)
            (herdr-sanctum-ime-sync-pane pane-id)))))
     ((or "pane_closed" "pane_exited")
      (when-let* ((pane-id (alist-get 'pane_id data)))
        (remhash pane-id herdr-sanctum-ime--panes)
+       (remhash pane-id herdr-sanctum-ime--pane-data)
        (when (equal pane-id herdr-sanctum-ime--focused-pane-id)
          (setq herdr-sanctum-ime--focused-pane-id nil))))))
 
@@ -205,30 +405,37 @@ Clear any manual override when the pane transitions between shell and agent."
 (defun herdr-sanctum-ime--clear ()
   "Reset tracked per-pane IME state."
   (clrhash herdr-sanctum-ime--panes)
-  (setq herdr-sanctum-ime--focused-pane-id nil))
+  (clrhash herdr-sanctum-ime--pane-data)
+  (setq herdr-sanctum-ime--last-snapshot nil
+        herdr-sanctum-ime--focused-pane-id nil
+        herdr-sanctum-ime--external-active nil
+        herdr-sanctum-ime--last-method nil))
 
 ;;;###autoload
 (define-minor-mode herdr-sanctum-ime-mode
   "Toggle automatic per-pane input method synchronization in `*sanctum*'."
   :global t
   :group 'herdr-sanctum-ime
-  (if herdr-sanctum-ime-mode
-      (progn
-        (add-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
-        (add-hook 'input-method-deactivate-hook #'herdr-sanctum-ime--record-deactivate)
-        (add-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
-        (add-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
-        (add-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
-        (add-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
-        (when-let* ((snap (herdr-sanctum-snapshot)))
-          (herdr-sanctum-ime--on-snapshot snap)))
-    (remove-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
-    (remove-hook 'input-method-deactivate-hook #'herdr-sanctum-ime--record-deactivate)
-    (remove-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
-    (remove-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
-    (remove-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
-    (remove-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
-    (herdr-sanctum-ime--clear)))
+  (let ((changed nil))
+    (if herdr-sanctum-ime-mode
+        (progn
+          (add-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
+          (add-hook 'input-method-deactivate-hook #'herdr-sanctum-ime--record-deactivate)
+          (add-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
+          (add-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
+          (add-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
+          (add-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
+          (when-let* ((snap (herdr-sanctum-snapshot)))
+            (setq changed (herdr-sanctum-ime--on-snapshot snap))))
+      (remove-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
+      (remove-hook 'input-method-deactivate-hook #'herdr-sanctum-ime--record-deactivate)
+      (remove-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
+      (remove-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
+      (remove-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
+      (remove-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
+      (herdr-sanctum-ime--clear))
+    (unless changed
+      (run-hooks 'herdr-sanctum-ime-change-hook))))
 
 (provide 'herdr-sanctum-ime)
 ;;; herdr-sanctum-ime.el ends here

@@ -41,9 +41,13 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function tab-bar--current-tab "tab-bar" (&optional frame))
+(declare-function tab-bar--tabs-recent "tab-bar" (&optional frame))
+
 (defvar herdr-sanctum-buffer-name "*sanctum*")
 (defvar herdr-sanctum-sidebar-buffer-name "*sanctum-spaces*")
 (defvar herdr-sanctum-drawer-buffer-name "*sanctum-drawer*")
+(defvar herdr-sanctum-tab-name "Sanctum")
 
 (defgroup herdr-sanctum-tab-routing nil
   "Declarative `tab-bar' buffer routing out of `herdr-sanctum'."
@@ -52,7 +56,13 @@
 
 (defcustom herdr-sanctum-tab-routing-rules nil
   "Declarative routing rules for buffers opened from Sanctum UI windows.
-Each rule has the form `(TAB-NAME . PLIST)' where PLIST supports:
+Each rule has the form `(TAB-NAME . PLIST)' where TAB-NAME is either a
+static tab name string or a 1-arg function `(BUFFER)' returning a target
+tab name string or nil (for example, a project name or Herdr workspace
+label).  When a TAB-NAME function returns nil or an empty string,
+evaluation continues to the next rule.
+
+PLIST supports:
   `:modes'       -- list of major modes (checked with `derived-mode-p')
   `:minor-modes' -- list of minor mode variables to check
   `:file'        -- when non-nil, match any file-visiting buffer
@@ -69,8 +79,39 @@ Note that commands which display their buffer before setting its major mode
 than `:modes'.  Because `herdr-sanctum-tab-routing-mode' routes via
 `display-buffer-in-tab', it relies on `tab-bar' and is intended for
 tab-based setups rather than `herdr-sanctum-display-mode' set to `frame'."
-  :type '(repeat (cons (string :tag "Target tab name")
+  :type '(repeat (cons (choice (string :tag "Target tab name")
+                               (function :tag "Function returning tab name"))
                        (plist :tag "Match criteria")))
+  :group 'herdr-sanctum-tab-routing)
+
+(defcustom herdr-sanctum-tab-routing-fallback-tab 'recent
+  "Fallback target tab for unmatched buffers opened from the Sanctum tab.
+Applies when `herdr-sanctum-tab-routing-mode' is active on the dedicated
+Sanctum tab (`herdr-sanctum-tab-name'), no rule in
+`herdr-sanctum-tab-routing-rules' matches, and the buffer is not excluded
+by `herdr-sanctum-tab-routing-exclude-rules':
+  `recent' -- route to the most recent non-Sanctum tab, or create \"Main\"
+              when Sanctum is the sole tab
+  string   -- route to that named tab
+  nil      -- do not route unmatched buffers."
+  :type '(choice (const :tag "Most recent non-Sanctum tab" recent)
+                 (string :tag "Fixed tab name")
+                 (const :tag "Do not route unmatched buffers" nil))
+  :group 'herdr-sanctum-tab-routing)
+
+(defcustom herdr-sanctum-tab-routing-exclude-rules
+  '("\\` ?\\*\\(?:Completions\\|which-key\\|Embark\\|[Tt]ransient\\|Minibuf\\|Calc\\)")
+  "Rules excluding buffers from `herdr-sanctum-tab-routing-fallback-tab'.
+Each element may be:
+  - a regexp string matched against `buffer-name'
+  - a major-mode symbol checked with `derived-mode-p'
+  - a 1-arg predicate function `(BUFFER)' returning non-nil to exclude.
+
+Explicit rules in `herdr-sanctum-tab-routing-rules' are checked before
+exclusion rules and always take precedence."
+  :type '(repeat (choice (regexp :tag "Buffer name regexp")
+                         (symbol :tag "Major mode symbol")
+                         (function :tag "Predicate (BUFFER)")))
   :group 'herdr-sanctum-tab-routing)
 
 (defun herdr-sanctum-tab-routing--rule-matches-p (buffer spec)
@@ -101,30 +142,104 @@ and `display-buffer-in-new-tab' to avoid re-evaluating rules and `:predicate'.")
       (equal name herdr-sanctum-sidebar-buffer-name)
       (equal name herdr-sanctum-drawer-buffer-name)))
 
+(defun herdr-sanctum-tab-routing--on-sanctum-tab-p ()
+  "Return non-nil when `tab-bar-mode' is active on the dedicated Sanctum tab."
+  (and (bound-and-true-p tab-bar-mode)
+       (fboundp 'tab-bar--current-tab)
+       (equal (alist-get 'name (tab-bar--current-tab))
+              herdr-sanctum-tab-name)))
+
 (defun herdr-sanctum-tab-routing--target-buffer (buffer-or-name)
-  "Return buffer for BUFFER-OR-NAME when routing from Sanctum UI applies."
+  "Return buffer for BUFFER-OR-NAME when routing from Sanctum applies."
   (when (and (not (active-minibuffer-window))
-             (herdr-sanctum-tab-routing--ui-buffer-name-p
-              (buffer-name (window-buffer))))
+             (or (herdr-sanctum-tab-routing--ui-buffer-name-p
+                  (buffer-name (window-buffer)))
+                 (herdr-sanctum-tab-routing--on-sanctum-tab-p)))
     (when-let* ((buffer (get-buffer buffer-or-name)))
       (unless (herdr-sanctum-tab-routing--ui-buffer-name-p (buffer-name buffer))
         buffer))))
 
+(defun herdr-sanctum-tab-routing--resolve-tab-name (tab-spec buffer)
+  "Resolve TAB-SPEC (string or 1-arg function) for BUFFER to a tab name string."
+  (let ((resolved (if (functionp tab-spec)
+                      (with-current-buffer buffer
+                        (funcall tab-spec buffer))
+                    tab-spec)))
+    (when (and (stringp resolved) (not (string-empty-p resolved)))
+      resolved)))
+
 (defun herdr-sanctum-tab-routing--match-rules (buffer)
   "Return target tab name matching BUFFER in `herdr-sanctum-tab-routing-rules'."
-  (cl-loop for (tab-name . spec) in herdr-sanctum-tab-routing-rules
-           when (herdr-sanctum-tab-routing--rule-matches-p buffer spec)
-           return tab-name))
+  (cl-loop for (tab-spec . spec) in herdr-sanctum-tab-routing-rules
+           thereis (and (herdr-sanctum-tab-routing--rule-matches-p buffer spec)
+                        (herdr-sanctum-tab-routing--resolve-tab-name
+                         tab-spec buffer))))
+
+(defun herdr-sanctum-tab-routing--exclude-rule-matches-p (buffer rule)
+  "Return non-nil when BUFFER matches exclude RULE."
+  (with-current-buffer buffer
+    (cond
+     ((stringp rule)
+      (string-match-p rule (buffer-name)))
+     ((and (not (symbolp rule)) (functionp rule))
+      (funcall rule buffer))
+     ((symbolp rule)
+      (or (derived-mode-p rule)
+          (and (functionp rule)
+               (not (get rule 'derived-mode-parent))
+               (not (string-suffix-p "-mode" (symbol-name rule)))
+               (let* ((arity (func-arity rule))
+                      (min-args (car arity))
+                      (max-args (cdr arity)))
+                 (and (<= min-args 1)
+                      (or (eq max-args 'many)
+                          (and (integerp max-args) (>= max-args 1)))))
+               (funcall rule buffer)))))))
+
+(defun herdr-sanctum-tab-routing--excluded-p (buffer)
+  "Return non-nil when BUFFER matches `herdr-sanctum-tab-routing-exclude-rules'."
+  (cl-some (lambda (rule)
+             (herdr-sanctum-tab-routing--exclude-rule-matches-p buffer rule))
+           herdr-sanctum-tab-routing-exclude-rules))
+
+(defun herdr-sanctum-tab-routing--recent-non-sanctum-tab ()
+  "Return the most recent non-Sanctum tab name, or \"Main\" when none exists."
+  (or (when (and (bound-and-true-p tab-bar-mode)
+                 (fboundp 'tab-bar--tabs-recent))
+        (cl-loop for tab in (tab-bar--tabs-recent)
+                 for name = (alist-get 'name tab)
+                 when (and (stringp name)
+                           (not (string-empty-p name))
+                           (not (equal name herdr-sanctum-tab-name)))
+                 return name))
+      "Main"))
+
+(defun herdr-sanctum-tab-routing--fallback-tab (buffer)
+  "Return fallback tab name for unmatched BUFFER on the dedicated Sanctum tab."
+  (when (and herdr-sanctum-tab-routing-fallback-tab
+             (herdr-sanctum-tab-routing--on-sanctum-tab-p)
+             (not (herdr-sanctum-tab-routing--excluded-p buffer)))
+    (cond
+     ((eq herdr-sanctum-tab-routing-fallback-tab 'recent)
+      (herdr-sanctum-tab-routing--recent-non-sanctum-tab))
+     ((and (stringp herdr-sanctum-tab-routing-fallback-tab)
+           (not (string-empty-p herdr-sanctum-tab-routing-fallback-tab)))
+      herdr-sanctum-tab-routing-fallback-tab))))
+
+(defun herdr-sanctum-tab-routing--target-tab (buffer)
+  "Return target tab name for BUFFER via explicit rules or fallback."
+  (or (herdr-sanctum-tab-routing--match-rules buffer)
+      (herdr-sanctum-tab-routing--fallback-tab buffer)))
 
 (defun herdr-sanctum-tab-routing-match (buffer-or-name)
-  "Return target tab name for BUFFER-OR-NAME when opened from Sanctum UI."
+  "Return target tab name for BUFFER-OR-NAME when opened from Sanctum."
   (when-let* ((buffer (herdr-sanctum-tab-routing--target-buffer buffer-or-name)))
-    (herdr-sanctum-tab-routing--match-rules buffer)))
+    (herdr-sanctum-tab-routing--target-tab buffer)))
 
 (defun herdr-sanctum-tab-routing--condition (buffer-or-name _action)
   "Return non-nil when BUFFER-OR-NAME matches a Sanctum tab routing rule."
   (if-let* ((buffer (herdr-sanctum-tab-routing--target-buffer buffer-or-name))
-            (tab (herdr-sanctum-tab-routing--match-rules buffer)))
+            (tab (herdr-sanctum-tab-routing--target-tab buffer)))
       (progn
         (setq herdr-sanctum-tab-routing--last-match (cons buffer tab))
         t)
@@ -134,7 +249,7 @@ and `display-buffer-in-new-tab' to avoid re-evaluating rules and `:predicate'.")
   "Return target tab name for BUFFER when invoked by `display-buffer-in-tab'."
   (if (eq (car-safe herdr-sanctum-tab-routing--last-match) buffer)
       (cdr herdr-sanctum-tab-routing--last-match)
-    (herdr-sanctum-tab-routing--match-rules buffer)))
+    (herdr-sanctum-tab-routing--target-tab buffer)))
 
 (defconst herdr-sanctum-tab-routing--entry
   (list #'herdr-sanctum-tab-routing--condition

@@ -743,5 +743,427 @@
         (should (equal (plist-get error-job :key) sig-key))
         (should-not (gethash sig-key herdr-sanctum-git--inflight))))))
 
+(ert-deftest herdr-sanctum-git-test/no-optional-locks-and-status-extra-args ()
+  "Background Git commands pass `--no-optional-locks' and status extra args."
+  (skip-unless (executable-find "git"))
+  (herdr-sanctum-test-with-clean-state
+    (herdr-sanctum-test-with-temp-dir repo
+      (let* ((file (herdr-sanctum-test--init-git-repo repo "a.txt" "line1\n" "main"))
+             (commands nil)
+             (orig-make-process (symbol-function 'make-process)))
+        (with-temp-file file (insert "line1\nline2\n"))
+        (with-temp-file (expand-file-name "untracked.txt" repo) (insert "new\n"))
+        (cl-letf (((symbol-function 'make-process)
+                   (lambda (&rest args)
+                     (let ((cmd (plist-get args :command)))
+                       (when (and (listp cmd) (cdr cmd))
+                         (push cmd commands)))
+                     (apply orig-make-process args))))
+          ;; 1. Both status and diffstat pass `--no-optional-locks' right after `--no-pager'.
+          (herdr-sanctum-git-fetch-dir repo t t)
+          (should (herdr-sanctum-test--wait-until
+                   (lambda ()
+                     (let ((i (herdr-sanctum-git-info-for-dir repo)))
+                       (and i (integerp (plist-get i :added))
+                            (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+                   4.0))
+          (should (>= (length commands) 2))
+          (dolist (cmd commands)
+            (should (equal (nth 1 cmd) "--no-pager"))
+            (should (equal (nth 2 cmd) "--no-optional-locks")))
+          (should (eql (plist-get (herdr-sanctum-git-info-for-dir repo) :untracked) 1))
+          ;; 2. `herdr-sanctum-git-status-extra-args' appends extra status flags.
+          (setq commands nil)
+          (let ((herdr-sanctum-git-status-extra-args '("--untracked-files=no")))
+            (herdr-sanctum-git-fetch-dir repo t nil)
+            (should (herdr-sanctum-test--wait-until
+                     (lambda ()
+                       (let ((i (herdr-sanctum-git-info-for-dir repo)))
+                         (and i (eql (plist-get i :untracked) 0)
+                              (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+                     4.0))
+            (let ((status-cmd (cl-find-if (lambda (c) (member "status" c)) commands)))
+              (should status-cmd)
+              (should (equal (car (last status-cmd)) "--untracked-files=no"))
+              (should (eql (plist-get (herdr-sanctum-git-info-for-dir repo) :dirty) 1)))))))))
+
+(ert-deftest herdr-sanctum-git-test/git-program-defcustom-resets-cache ()
+  "Customizing `herdr-sanctum-git-program' resets cached executable immediately."
+  (let ((orig-program herdr-sanctum-git-program)
+        (herdr-sanctum-git--executable nil)
+        (herdr-sanctum-git--executable-program nil)
+        (seen-cmds nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (cmd &rest _)
+                     (push cmd seen-cmds)
+                     (concat "/resolved/" cmd))))
+          (should (equal (herdr-sanctum-git--executable) "/resolved/git"))
+          (should (equal herdr-sanctum-git--executable "/resolved/git"))
+          ;; Changing via `customize-set-variable' immediately clears cache.
+          (customize-set-variable 'herdr-sanctum-git-program "custom-git")
+          (should-not herdr-sanctum-git--executable)
+          (should (equal (herdr-sanctum-git--executable) "/resolved/custom-git"))
+          (should (equal seen-cmds '("custom-git" "git")))
+          ;; Dynamic `let'-binding also resolves the bound program cleanly.
+          (let ((herdr-sanctum-git-program "let-git"))
+            (should (equal (herdr-sanctum-git--executable) "/resolved/let-git")))
+          (should (equal (herdr-sanctum-git--executable) "/resolved/custom-git")))
+      (customize-set-variable 'herdr-sanctum-git-program orig-program))))
+
+(ert-deftest herdr-sanctum-git-test/command-timeout-reaps-hung-job-and-cancels-timers ()
+  "Hung Git jobs are killed on timeout, free slots/stderr, and cancel timers."
+  (skip-unless (executable-find "git"))
+  (herdr-sanctum-test-with-clean-state
+    (let* ((count-stderr-pipes
+            (lambda ()
+              (cl-count-if (lambda (p)
+                             (string-prefix-p "herdr-sanctum-git-stderr"
+                                              (process-name p)))
+                           (process-list))))
+           (blocker-procs nil))
+      (unwind-protect
+          (progn
+            ;; 1. Hung job times out, invokes `:on-error', frees slot for queued job,
+            ;;    and cleans up stderr pipe.
+            (dotimes (i (1- herdr-sanctum-git--max-concurrency))
+              (let ((p (make-process :name (format "herdr-timeout-block-%d" i)
+                                     :buffer nil :command '("sleep" "5")
+                                     :connection-type 'pipe :noquery t)))
+                (push (cons (format "tblock:%d" i) p) blocker-procs)
+                (puthash (format "tblock:%d" i) p herdr-sanctum-git--inflight)))
+            (let ((herdr-sanctum-git-command-timeout 0.15)
+                  (hung-exit nil)
+                  (hung-err-count 0)
+                  (hung-err-job nil)
+                  (next-code nil)
+                  (next-out nil))
+              (herdr-sanctum-git--enqueue-git
+               :key "timeout:hung"
+               :name "herdr-sanctum-git-hung"
+               :args '("hash-object" "--stdin")
+               :on-exit (lambda (&rest _) (setq hung-exit t))
+               :on-error (lambda (j)
+                           (cl-incf hung-err-count)
+                           (setq hung-err-job j)))
+              (herdr-sanctum-git--enqueue-git
+               :key "timeout:queued"
+               :name "herdr-sanctum-git-queued"
+               :args '("--version")
+               :on-exit (lambda (code out _p _j)
+                          (setq next-code code next-out out)))
+              (let* ((hung-proc (gethash "timeout:hung" herdr-sanctum-git--inflight))
+                     (timer (process-get hung-proc 'herdr-sanctum-git-timer)))
+                (should (process-live-p hung-proc))
+                (should (timerp timer))
+                (should (memq timer timer-list))
+                (should (= (length herdr-sanctum-git--low-queue) 1))
+                (should (herdr-sanctum-test--wait-until
+                         (lambda () (and (= hung-err-count 1) (integerp next-code)))
+                         3.0))
+                (accept-process-output nil 0.05)
+                (should-not hung-exit)
+                (should (= hung-err-count 1))
+                (should (equal (plist-get hung-err-job :key) "timeout:hung"))
+                (should-not (process-live-p hung-proc))
+                (should-not (gethash "timeout:hung" herdr-sanctum-git--inflight))
+                (should (zerop next-code))
+                (should (string-search "git version" next-out))
+                (should (zerop (funcall count-stderr-pipes)))
+                (should-not (memq timer timer-list))))
+            ;; Clear blockers before testing sentinel & clear timer cancellation.
+            (dolist (entry blocker-procs)
+              (remhash (car entry) herdr-sanctum-git--inflight)
+              (when (process-live-p (cdr entry)) (delete-process (cdr entry))))
+            (setq blocker-procs nil)
+            ;; 2. Normal exit cancels its timeout timer.
+            (let ((herdr-sanctum-git-command-timeout 30.0)
+                  (done-code nil))
+              (herdr-sanctum-git--start-job
+               (list :key "timeout:fast"
+                     :name "herdr-sanctum-git-fast"
+                     :args '("--version")
+                     :on-exit (lambda (code _out _p _j) (setq done-code code))))
+              (let* ((proc (gethash "timeout:fast" herdr-sanctum-git--inflight))
+                     (timer (and proc (process-get proc 'herdr-sanctum-git-timer))))
+                (should (herdr-sanctum-test--wait-until
+                         (lambda () (integerp done-code)) 3.0))
+                (should (zerop done-code))
+                (when timer
+                  (should-not (memq timer timer-list)))))
+            ;; 3. `herdr-sanctum-git-clear' cancels active timeout timers and stderr pipes.
+            (let ((herdr-sanctum-git-command-timeout 30.0))
+              (herdr-sanctum-git--start-job
+               (list :key "timeout:clear"
+                     :name "herdr-sanctum-git-clear-timer"
+                     :args '("hash-object" "--stdin")
+                     :on-exit #'ignore))
+              (let* ((proc (gethash "timeout:clear" herdr-sanctum-git--inflight))
+                     (timer (process-get proc 'herdr-sanctum-git-timer)))
+                (should (timerp timer))
+                (should (memq timer timer-list))
+                (should (= (funcall count-stderr-pipes) 1))
+                (herdr-sanctum-git-clear)
+                (should-not (memq timer timer-list))
+                (should (zerop (funcall count-stderr-pipes)))))
+            ;; 4. Nil timeout disables timer arming.
+            (let ((herdr-sanctum-git-command-timeout nil))
+              (herdr-sanctum-git--start-job
+               (list :key "timeout:nil"
+                     :name "herdr-sanctum-git-no-timer"
+                     :args '("hash-object" "--stdin")
+                     :on-exit #'ignore))
+              (let ((proc (gethash "timeout:nil" herdr-sanctum-git--inflight)))
+                (should (process-live-p proc))
+                (should-not (process-get proc 'herdr-sanctum-git-timer)))
+              (herdr-sanctum-git-clear)))
+        (dolist (entry blocker-procs)
+          (remhash (car entry) herdr-sanctum-git--inflight)
+          (when (and (processp (cdr entry)) (process-live-p (cdr entry)))
+            (delete-process (cdr entry))))))))
+
+(ert-deftest herdr-sanctum-git-test/monorepo-subdir-dedup-worktrees-and-deletion ()
+  "Subdirs share one poll/cache entry; worktrees stay distinct; deleted subdirs evict."
+  (skip-unless (executable-find "git"))
+  (herdr-sanctum-test-with-clean-state
+    (herdr-sanctum-test-with-temp-dir root-tmp
+      (let* ((repo (expand-file-name "mono" root-tmp))
+             (norm-repo (file-name-as-directory (expand-file-name repo)))
+             (api (expand-file-name "packages/api" repo))
+             (web (expand-file-name "packages/web" repo))
+             (docs (expand-file-name "docs" repo))
+             (never-polled (expand-file-name "packages/other" repo))
+             (link-web (expand-file-name "link-web" root-tmp))
+             (wt (expand-file-name "mono-wt" root-tmp))
+             (wt-src (expand-file-name "src" wt))
+             (multi (expand-file-name "multi-parent" root-tmp))
+             (norm-api (file-name-as-directory (expand-file-name api)))
+             (norm-web (file-name-as-directory (expand-file-name web)))
+             (norm-docs (file-name-as-directory (expand-file-name docs)))
+             (norm-wt (file-name-as-directory (expand-file-name wt)))
+             (api-file (herdr-sanctum-test--init-git-repo
+                        repo "packages/api/main.el" "a1\na2\n" "main"))
+             (status-starts 0)
+             (diffstat-starts 0)
+             (orig-start (symbol-function 'herdr-sanctum-git--start-job))
+             (hook-dirs nil)
+             (hook-events nil)
+             (hook-fn (lambda (dir info)
+                        (push dir hook-dirs)
+                        (push (cons dir info) hook-events))))
+        (make-directory web t)
+        (make-directory docs t)
+        (make-directory never-polled t)
+        (make-symbolic-link web link-web)
+        (should (zerop (call-process "git" nil nil nil
+                                     "-C" repo "worktree" "add" "-b" "wt-branch" wt)))
+        (make-directory wt-src t)
+        (herdr-sanctum-test--init-git-repo (expand-file-name "sub1" multi) "s.txt" "s\n")
+        (with-temp-file api-file (insert "a1\na2-mod\na3\n"))
+        (unwind-protect
+            (progn
+              (add-hook 'herdr-sanctum-git-update-hook hook-fn)
+              ;; 1. Root resolution handles subdirs, worktrees, non-git multi-repo, remote.
+              (should (equal (herdr-sanctum-git--find-repo-root repo) norm-repo))
+              (should (equal (herdr-sanctum-git--find-repo-root api) norm-repo))
+              (should (equal (herdr-sanctum-git--find-repo-root web) norm-repo))
+              (should (equal (herdr-sanctum-git--find-repo-root wt) norm-wt))
+              (should (equal (herdr-sanctum-git--find-repo-root wt-src) norm-wt))
+              (should-not (herdr-sanctum-git--find-repo-root multi))
+              (should-not (herdr-sanctum-git--find-repo-root "/ssh:host:/srv/app"))
+              ;; 2. 3 workspaces in 1 monorepo via forced refresh-snapshot launch 1 status.
+              (let ((snap (herdr-sanctum-test-make-snapshot
+                           :focused-ws "w1" :focused-tab "w1:t1" :focused-pane "w1:p1"
+                           :workspaces '(((workspace_id . "w1") (active_tab_id . "w1:t1"))
+                                         ((workspace_id . "w2") (active_tab_id . "w2:t1"))
+                                         ((workspace_id . "w3") (active_tab_id . "w3:t1")))
+                           :tabs '(((tab_id . "w1:t1") (workspace_id . "w1"))
+                                   ((tab_id . "w2:t1") (workspace_id . "w2"))
+                                   ((tab_id . "w3:t1") (workspace_id . "w3")))
+                           :panes `(((pane_id . "w1:p1") (workspace_id . "w1")
+                                     (tab_id . "w1:t1") (focused . t) (foreground_cwd . ,api))
+                                    ((pane_id . "w2:p1") (workspace_id . "w2")
+                                     (tab_id . "w2:t1") (foreground_cwd . ,web))
+                                    ((pane_id . "w3:p1") (workspace_id . "w3")
+                                     (tab_id . "w3:t1") (foreground_cwd . ,docs))))))
+                (cl-letf (((symbol-function 'herdr-sanctum-git--start-job)
+                           (lambda (job)
+                             (pcase (plist-get job :name)
+                               ("herdr-sanctum-git-status" (cl-incf status-starts))
+                               ("herdr-sanctum-git-diffstat" (cl-incf diffstat-starts)))
+                             (funcall orig-start job))))
+                  (herdr-sanctum-git-refresh-snapshot snap t)
+                  (should (herdr-sanctum-test--wait-until
+                           (lambda ()
+                             (let ((i (herdr-sanctum-git-info-for-dir api)))
+                               (and i (integerp (plist-get i :added))
+                                    (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+                           4.0))
+                  (should (= status-starts 1))
+                  (should (= diffstat-starts 1))))
+              ;; Shared `eq' cache object across all subdirs, symlink, and unpolled subdir.
+              (let ((info-api (herdr-sanctum-git-info-for-dir api))
+                    (info-web (herdr-sanctum-git-info-for-dir web))
+                    (info-docs (herdr-sanctum-git-info-for-dir docs))
+                    (info-root (herdr-sanctum-git-info-for-dir repo))
+                    (info-link (herdr-sanctum-git-info-for-dir link-web))
+                    (info-other (herdr-sanctum-git-info-for-dir never-polled)))
+                (should info-api)
+                (should (eq info-web info-api))
+                (should (eq info-docs info-api))
+                (should (eq info-root info-api))
+                (should (eq info-link info-api))
+                (should (eq info-other info-api))
+                (should (equal (plist-get info-api :root) norm-repo))
+                (should (eql (plist-get info-api :added) 2))
+                (should (eql (plist-get info-api :removed) 1)))
+              (should (member norm-api hook-dirs))
+              (should (member norm-web hook-dirs))
+              (should (member norm-docs hook-dirs))
+              ;; 3. Concurrent direct `fetch-dir' across sibling subdirs shares 1 inflight job.
+              (setq status-starts 0)
+              (herdr-sanctum-git-clear)
+              (cl-letf (((symbol-function 'herdr-sanctum-git--start-job)
+                         (lambda (job)
+                           (when (equal (plist-get job :name) "herdr-sanctum-git-status")
+                             (cl-incf status-starts))
+                           (funcall orig-start job))))
+                (herdr-sanctum-git-fetch-dir web nil nil)
+                (herdr-sanctum-git-fetch-dir docs nil nil)
+                (herdr-sanctum-git-fetch-dir api nil t)
+                (should (herdr-sanctum-test--wait-until
+                         (lambda ()
+                           (let ((i (herdr-sanctum-git-info-for-dir api)))
+                             (and i (integerp (plist-get i :added))
+                                  (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+                         4.0))
+                (should (= status-starts 1)))
+              ;; 4. Worktree subdir stays independent from main repo.
+              (herdr-sanctum-git-fetch-dir wt-src t nil)
+              (should (herdr-sanctum-test--wait-until
+                       (lambda () (herdr-sanctum-git-info-for-dir wt-src)) 3.0))
+              (should (equal (plist-get (herdr-sanctum-git-info-for-dir wt-src) :branch)
+                             "wt-branch"))
+              (should (equal (plist-get (herdr-sanctum-git-info-for-dir api) :branch)
+                             "main"))
+              ;; 5. Deleting one subdir evicts only that subdir, preserving sibling cache.
+              (setq hook-events nil)
+              (delete-directory docs t)
+              (herdr-sanctum-git-fetch-dir docs nil nil)
+              (should-not (herdr-sanctum-git-info-for-dir docs))
+              (should-not (gethash norm-docs herdr-sanctum-git--dir-to-root))
+              (should (equal hook-events (list (cons norm-docs nil))))
+              (should (herdr-sanctum-git-info-for-dir api))
+              ;; 6. `herdr-sanctum-git-clear' empties `--dir-to-root'.
+              (herdr-sanctum-git-clear)
+              (should (= (hash-table-count herdr-sanctum-git--dir-to-root) 0)))
+          (remove-hook 'herdr-sanctum-git-update-hook hook-fn))))))
+
+(ert-deftest herdr-sanctum-git-test/enable-remote-exclude-diffstat-and-skip-names ()
+  "Guards honor git-enable, skip-remote, exclude-dirs, diffstat-enable, and skip-names."
+  (skip-unless (executable-find "git"))
+  (herdr-sanctum-test-with-clean-state
+    (herdr-sanctum-test-with-temp-dir tmp
+      (let* ((repo (expand-file-name "repo" tmp))
+             (repo-sub (expand-file-name "sub" repo))
+             (repo-sib (expand-file-name "repo-sib" tmp))
+             (multi (expand-file-name "multi" tmp))
+             (repo-f (herdr-sanctum-test--init-git-repo repo "a.txt" "a1\n" "main"))
+             (multi-a (expand-file-name "alpha" multi))
+             (multi-skip (expand-file-name "custom_skip" multi)))
+        (make-directory repo-sub t)
+        (herdr-sanctum-test--init-git-repo repo-sib "b.txt" "b1\n" "main")
+        (let ((ma-f (herdr-sanctum-test--init-git-repo multi-a "m.txt" "m1\n" "main")))
+          (with-temp-file ma-f (insert "m1\nm2\n")))
+        (herdr-sanctum-test--init-git-repo multi-skip "c.txt" "c1\n" "main")
+        (with-temp-file repo-f (insert "a1\na2\n"))
+        ;; 1. `herdr-sanctum-git-enable' nil makes fetch-dir and refresh-snapshot no-ops.
+        (let ((herdr-sanctum-git-enable nil)
+              (snap (herdr-sanctum-test-make-snapshot :dir repo)))
+          (herdr-sanctum-git-fetch-dir repo t t)
+          (herdr-sanctum-git-refresh-snapshot snap t)
+          (should (= (hash-table-count herdr-sanctum-git--inflight) 0))
+          (should-not (herdr-sanctum-git-info-for-dir repo)))
+        ;; 2. `herdr-sanctum-git-skip-remote' skips remote paths with zero TRAMP I/O.
+        (let ((herdr-sanctum-git-skip-remote t)
+              (stat-calls 0)
+              (orig-dir-p (symbol-function 'file-directory-p)))
+          (cl-letf (((symbol-function 'file-directory-p)
+                     (lambda (p)
+                       (when (string-prefix-p "/ssh:" p) (cl-incf stat-calls))
+                       (funcall orig-dir-p p))))
+            (herdr-sanctum-git-fetch-dir "/ssh:example.com:/srv/app" t t)
+            (should-not (herdr-sanctum-git-info-for-dir "/ssh:example.com:/srv/app"))
+            (should (= stat-calls 0))
+            (should (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+        ;; 3. `herdr-sanctum-git-exclude-dirs': prefix, regexp, and predicate.
+        (let ((herdr-sanctum-git-exclude-dirs (list repo)))
+          (herdr-sanctum-git-fetch-dir repo t nil)
+          (herdr-sanctum-git-fetch-dir repo-sub t nil)
+          (should (= (hash-table-count herdr-sanctum-git--inflight) 0))
+          ;; Sibling sharing a string prefix (`repo-sib' vs `repo/') is NOT excluded.
+          (herdr-sanctum-git-fetch-dir repo-sib t nil)
+          (should (herdr-sanctum-test--wait-until
+                   (lambda () (herdr-sanctum-git-info-for-dir repo-sib)) 3.0))
+          (should-not (herdr-sanctum-git-info-for-dir repo)))
+        (herdr-sanctum-git-clear)
+        (let ((herdr-sanctum-git-exclude-dirs '((regexp . "/repo/sub/"))))
+          (herdr-sanctum-git-fetch-dir repo-sub t nil)
+          (should (= (hash-table-count herdr-sanctum-git--inflight) 0)))
+        (let ((herdr-sanctum-git-exclude-dirs
+               (list (lambda (d) (string-search "/repo/" d)))))
+          (herdr-sanctum-git-fetch-dir repo t nil)
+          (should (= (hash-table-count herdr-sanctum-git--inflight) 0)))
+        ;; 4. `herdr-sanctum-git-diffstat-enable' nil skips diffstat on single & multi repos.
+        (herdr-sanctum-git-clear)
+        (let ((herdr-sanctum-git-diffstat-enable nil)
+              (herdr-sanctum-git-cache-ttl 60.0)
+              (diffstat-jobs 0)
+              (orig-start (symbol-function 'herdr-sanctum-git--start-job)))
+          (cl-letf (((symbol-function 'herdr-sanctum-git--start-job)
+                     (lambda (job)
+                       (when (member (plist-get job :name)
+                                     '("herdr-sanctum-git-diffstat"
+                                       "herdr-sanctum-git-subdiff"))
+                         (cl-incf diffstat-jobs))
+                       (funcall orig-start job))))
+            (herdr-sanctum-git-fetch-dir repo t t)
+            (should (herdr-sanctum-test--wait-until
+                     (lambda ()
+                       (and (herdr-sanctum-git-info-for-dir repo)
+                            (= (hash-table-count herdr-sanctum-git--inflight) 0)))
+                     3.0))
+            (let ((info (herdr-sanctum-git-info-for-dir repo)))
+              (should (eql (plist-get info :dirty) 1))
+              (should-not (plist-get info :added))
+              (should-not (plist-get info :removed)))
+            ;; TTL upgrade request with `with-diffstat' still skips diffstat.
+            (herdr-sanctum-git-fetch-dir repo nil t)
+            (should (= (hash-table-count herdr-sanctum-git--inflight) 0))
+            ;; Multi-repo with `with-diffstat' also skips subdiff jobs.
+            (herdr-sanctum-git-fetch-dir multi t t)
+            (should (herdr-sanctum-test--wait-until
+                     (lambda ()
+                       (let ((i (herdr-sanctum-git-info-for-dir multi)))
+                         (and i (plist-get i :multi-repo)
+                              (= (hash-table-count herdr-sanctum-git--inflight) 0))))
+                     4.0))
+            (should (= diffstat-jobs 0))
+            (let ((alpha-repo (cl-find "alpha"
+                                       (plist-get (herdr-sanctum-git-info-for-dir multi) :repos)
+                                       :key (lambda (r) (plist-get r :name))
+                                       :test #'equal)))
+              (should alpha-repo)
+              (should (eql (plist-get alpha-repo :dirty) 1))
+              (should-not (plist-get alpha-repo :added))
+              (should-not (plist-get alpha-repo :removed)))))
+        ;; 5. `herdr-sanctum-git-subrepo-skip-names' defcustom & alias work.
+        (should (eq (indirect-variable 'herdr-sanctum-git--subrepo-skip-names)
+                    'herdr-sanctum-git-subrepo-skip-names))
+        (let ((herdr-sanctum-git-subrepo-skip-names
+               (cons "custom_skip" herdr-sanctum-git-subrepo-skip-names)))
+          (should (equal (mapcar #'car (herdr-sanctum-git--discover-subrepos multi))
+                         '("alpha"))))))))
+
 (provide 'herdr-sanctum-git-test)
 ;;; herdr-sanctum-git-test.el ends here

@@ -93,7 +93,8 @@ KIND is the event type string (for example \"pane_focused\" or
   :group 'herdr-sanctum)
 
 (defcustom herdr-sanctum-snapshot-hook nil
-  "Hook run with `(SNAPSHOT)' whenever a fresh Herdr snapshot is applied."
+  "Hook run with `(SNAPSHOT)' whenever a fresh Herdr snapshot is applied.
+SNAPSHOT is nil when stale state is cleared after a real disconnect."
   :type 'hook
   :group 'herdr-sanctum)
 
@@ -104,7 +105,9 @@ KIND is the event type string (for example \"pane_focused\" or
 
 (defcustom herdr-sanctum-agent-status-change-hook nil
   "Hook run with `(AGENT OLD-STATUS NEW-STATUS)' when an agent status changes.
-AGENT is the agent alist from the Herdr snapshot."
+AGENT is the agent alist from the Herdr snapshot.  Use
+`herdr-sanctum-agent-display-info' to resolve workspace, tab, and
+directory metadata."
   :type 'hook
   :group 'herdr-sanctum)
 
@@ -127,6 +130,9 @@ Used to refresh relative agent durations and idle Git metadata."
 
 (defconst herdr-sanctum--agent-sub-max-retry-delay 30.0
   "Maximum exponential backoff delay in seconds for agent-status retries.")
+
+(defconst herdr-sanctum--reconnect-ramp '(0.2 0.5 1.0)
+  "Initial cold-start reconnect delays in seconds before steady-state polling.")
 
 (defconst herdr-sanctum--subscriptions
   '("workspace.created"
@@ -151,6 +157,9 @@ Used to refresh relative agent durations and idle Git metadata."
 
 (defvar herdr-sanctum--sub-process nil
   "Persistent local socket subscription to Herdr server lifecycle events.")
+
+(defvar herdr-sanctum--connected-socket-path nil
+  "Socket path currently bound to `herdr-sanctum--sub-process', or nil.")
 
 (defvar herdr-sanctum--agent-sub-process nil
   "Persistent local socket subscription to per-pane `pane.agent_status_changed'.")
@@ -196,6 +205,9 @@ Values are nil, `normal', or `force'.")
 
 (defvar herdr-sanctum--reconnect-timer nil
   "Retry timer reconnecting to `herdr.sock' while Sanctum buffers are live.")
+
+(defvar herdr-sanctum--reconnect-attempt 0
+  "Consecutive reconnect attempt counter for cold-start backoff ramp.")
 
 (defvar herdr-sanctum--snapshot nil
   "Latest parsed Herdr `session.snapshot' alist.")
@@ -357,6 +369,65 @@ Values are nil, `normal', or `force'.")
     ("blocked" 0)
     ("done"    1)
     ("working" 2)))
+
+(defun herdr-sanctum-agent-display-info (agent &optional snapshot)
+  "Return a display metadata plist for AGENT resolved against SNAPSHOT.
+SNAPSHOT defaults to `(herdr-sanctum-snapshot)'.  The returned plist has keys
+`:pane-id', `:workspace-id', `:workspace-label', `:tab-id', `:tab-label',
+`:agent', `:status', `:topic', and `:dir'."
+  (let* ((snap (or snapshot (herdr-sanctum-snapshot)))
+         (non-empty (lambda (s)
+                      (and (stringp s) (not (string-empty-p s)) s)))
+         (pane-id (alist-get 'pane_id agent))
+         (pane (and pane-id
+                    (seq-find (lambda (p)
+                                (equal (alist-get 'pane_id p) pane-id))
+                              (alist-get 'panes snap))))
+         (ws-id (or (alist-get 'workspace_id agent)
+                    (alist-get 'workspace_id pane)))
+         (tab-id (or (alist-get 'tab_id agent)
+                     (alist-get 'tab_id pane)))
+         (ws (and ws-id
+                  (seq-find (lambda (w)
+                              (equal (alist-get 'workspace_id w) ws-id))
+                            (alist-get 'workspaces snap))))
+         (tab (and tab-id
+                   (seq-find (lambda (tb)
+                               (equal (alist-get 'tab_id tb) tab-id))
+                             (alist-get 'tabs snap))))
+         (ws-label (or (funcall non-empty (alist-get 'label ws))
+                       (funcall non-empty ws-id)))
+         (tab-label (or (funcall non-empty (alist-get 'label tab))
+                        (funcall non-empty tab-id)))
+         (agent-name (or (funcall non-empty (alist-get 'display_agent agent))
+                         (funcall non-empty (alist-get 'agent agent))
+                         (funcall non-empty (alist-get 'display_agent pane))
+                         (funcall non-empty (alist-get 'agent pane))))
+         (status (or (funcall non-empty (alist-get 'agent_status agent))
+                     (funcall non-empty (alist-get 'agent_status pane))))
+         (raw-topic (alist-get 'topic (alist-get 'tokens agent)))
+         (topic (when (stringp raw-topic)
+                  (let ((trimmed (string-trim raw-topic)))
+                    (unless (string-empty-p trimmed) trimmed))))
+         (pane-dir (seq-some
+                    (lambda (raw)
+                      (when (and (stringp raw)
+                                 (not (string-empty-p raw))
+                                 (file-directory-p raw))
+                        (file-name-as-directory (expand-file-name raw))))
+                    (list (alist-get 'foreground_cwd pane)
+                          (alist-get 'cwd pane))))
+         (dir (or pane-dir
+                  (and ws (herdr-sanctum-workspace-dir ws snap)))))
+    (list :pane-id pane-id
+          :workspace-id ws-id
+          :workspace-label ws-label
+          :tab-id tab-id
+          :tab-label tab-label
+          :agent agent-name
+          :status status
+          :topic topic
+          :dir dir)))
 
 (defun herdr-sanctum-attention-agents (&optional snapshot)
   "Return non-idle agents from SNAPSHOT sorted by blocked -> done -> working."
@@ -527,7 +598,7 @@ and avoids quadratic string copying on fragmented chunks."
 (defun herdr-sanctum--handle-event-line (line)
   "Handle one Herdr subscription event LINE.
 Return `ack' for `subscription_started' acknowledgments, `immediate' for
-tab/workspace focus changes, `schedule' for other events, `(error . ERR)'
+pane/tab/workspace focus changes, `schedule' for other events, `(error . ERR)'
 for JSON-RPC error responses, or nil for blank/unrecognized lines."
   (unless (string-blank-p line)
     (when-let* ((parsed (herdr-sanctum--parse-json-line line)))
@@ -544,7 +615,10 @@ for JSON-RPC error responses, or nil for blank/unrecognized lines."
             (when (stringp kind)
               (run-hook-with-args 'herdr-sanctum-event-hook kind data)
               (pcase kind
-                ((or "tab_focused" "workspace_focused") 'immediate)
+                ((or "pane_focused" "pane.focused"
+                     "tab_focused" "tab.focused"
+                     "workspace_focused" "workspace.focused")
+                 'immediate)
                 (_ 'schedule))))))))))
 
 (defun herdr-sanctum--consume-event-chunk (proc chunk &optional on-error on-ack)
@@ -622,6 +696,7 @@ Return the live network process on success, or nil on connection error."
                      (when (functionp on-close)
                        (funcall on-close p))))))
           (set proc-var proc)
+          (process-put proc 'herdr-sanctum-socket-path sock)
           (process-send-string proc payload)
           proc)
       (error
@@ -917,75 +992,150 @@ fetch instead of aborting the in-flight request."
       (setq herdr-sanctum--refresh-timer
             (run-with-timer delay nil #'herdr-sanctum-request-snapshot)))))
 
+(defun herdr-sanctum--clear-stale-snapshot ()
+  "Clear cached snapshot state after disconnect without killing UI buffers."
+  (when herdr-sanctum--snapshot
+    (herdr-sanctum--abort-snapshot t)
+    (clrhash herdr-sanctum--agent-timestamps)
+    (setq herdr-sanctum--timestamps-socket nil
+          herdr-sanctum--snapshot nil
+          herdr-sanctum--focused-dir-cache nil
+          herdr-sanctum--ws-dir-cache nil
+          herdr-sanctum--last-focus-key nil)
+    (run-hook-with-args 'herdr-sanctum-snapshot-hook nil)
+    (force-mode-line-update t)))
+
+(defun herdr-sanctum--socket-changed-p (sock)
+  "Return non-nil when active subscription uses a socket other than SOCK."
+  (and (process-live-p herdr-sanctum--sub-process)
+       (let ((active (or (process-get herdr-sanctum--sub-process
+                                      'herdr-sanctum-socket-path)
+                         herdr-sanctum--connected-socket-path)))
+         (not (equal active sock)))))
+
+(defun herdr-sanctum--reset-for-socket-switch ()
+  "Close old subscriptions and reset cached state before switching sockets."
+  (when (timerp herdr-sanctum--refresh-timer)
+    (cancel-timer herdr-sanctum--refresh-timer)
+    (setq herdr-sanctum--refresh-timer nil))
+  (when (timerp herdr-sanctum--reconnect-timer)
+    (cancel-timer herdr-sanctum--reconnect-timer)
+    (setq herdr-sanctum--reconnect-timer nil))
+  (herdr-sanctum--close-agent-subscription)
+  (herdr-sanctum--abort-snapshot t)
+  (let ((proc herdr-sanctum--sub-process))
+    (setq herdr-sanctum--sub-process nil
+          herdr-sanctum--connected-socket-path nil)
+    (when (process-live-p proc)
+      (delete-process proc)))
+  (setq herdr-sanctum--events-lost-retry-count 0
+        herdr-sanctum--sub-ack-time nil
+        herdr-sanctum--reconnect-attempt 0)
+  (if herdr-sanctum--snapshot
+      (herdr-sanctum--clear-stale-snapshot)
+    (clrhash herdr-sanctum--agent-timestamps)
+    (setq herdr-sanctum--timestamps-socket nil
+          herdr-sanctum--focused-dir-cache nil
+          herdr-sanctum--ws-dir-cache nil
+          herdr-sanctum--last-focus-key nil)))
+
 (defun herdr-sanctum--schedule-reconnect (&optional delay)
-  "Retry connecting to `herdr.sock' after DELAY while Sanctum buffers are live."
+  "Retry connecting to `herdr.sock' after DELAY while Sanctum buffers are live.
+When DELAY is nil, ramp through `herdr-sanctum--reconnect-ramp' capped at
+`herdr-sanctum-reconnect-interval'."
   (when (and (herdr-sanctum-any-ui-buffer-live-p)
              (not (timerp herdr-sanctum--reconnect-timer)))
-    (setq herdr-sanctum--reconnect-timer
-          (run-with-timer (or delay herdr-sanctum-reconnect-interval) nil
-                          (lambda ()
-                            (setq herdr-sanctum--reconnect-timer nil)
-                            (when (herdr-sanctum-any-ui-buffer-live-p)
-                              (herdr-sanctum-ensure-connected)))))))
+    (let ((wait (or delay
+                    (let* ((idx herdr-sanctum--reconnect-attempt)
+                           (step (or (nth idx herdr-sanctum--reconnect-ramp)
+                                     herdr-sanctum-reconnect-interval)))
+                      (cl-incf herdr-sanctum--reconnect-attempt)
+                      (min step herdr-sanctum-reconnect-interval)))))
+      (setq herdr-sanctum--reconnect-timer
+            (run-with-timer wait nil
+                            (lambda ()
+                              (setq herdr-sanctum--reconnect-timer nil)
+                              (when (herdr-sanctum-any-ui-buffer-live-p)
+                                (herdr-sanctum-ensure-connected))))))))
 
 (defun herdr-sanctum-ensure-connected (&optional force)
   "Connect to `herdr.sock' for focus and agent events when not already connected.
+If an active subscription targets a different socket than
+`herdr-sanctum-socket-path', close it, reset cached state, and reconnect.
 Optional FORCE is passed through to `herdr-sanctum-request-snapshot'."
-  (unless (process-live-p herdr-sanctum--sub-process)
-    (let ((sock (herdr-sanctum-socket-path)))
+  (let ((sock (herdr-sanctum-socket-path)))
+    (when (herdr-sanctum--socket-changed-p sock)
+      (herdr-sanctum--reset-for-socket-switch))
+    (unless (process-live-p herdr-sanctum--sub-process)
       (if (not (file-exists-p sock))
-          (herdr-sanctum--schedule-reconnect)
-        (progn
-          (setq herdr-sanctum--sub-ack-time nil)
-          (if (herdr-sanctum--open-subscription
-               :name "herdr-sanctum-events"
-               :sock sock
-               :id "emacs:sub"
-               :subscriptions (vconcat
-                               (mapcar (lambda (typ) `((type . ,typ)))
-                                       herdr-sanctum--subscriptions))
-               :proc-var 'herdr-sanctum--sub-process
-               :on-error
-               (lambda (proc err)
-                 (let* ((fast (equal (alist-get 'code err) "events_lost"))
-                        (ack-time herdr-sanctum--sub-ack-time)
-                        (delay nil))
-                   (setq herdr-sanctum--sub-ack-time nil)
-                   (when fast
-                     (when (and ack-time
-                                (> (- (float-time) ack-time)
-                                   herdr-sanctum-reconnect-interval))
-                       (setq herdr-sanctum--events-lost-retry-count 0))
-                     (setq delay (min herdr-sanctum-reconnect-interval
-                                      (* 0.25 (expt 2 (min herdr-sanctum--events-lost-retry-count 5)))))
-                     (cl-incf herdr-sanctum--events-lost-retry-count))
-                   (setq herdr-sanctum--sub-process nil)
-                   (herdr-sanctum--close-agent-subscription)
-                   (when (process-live-p proc)
-                     (delete-process proc))
-                   (herdr-sanctum--schedule-reconnect delay)))
-               :on-ack
-               (lambda ()
-                 (setq herdr-sanctum--sub-ack-time (float-time)))
-               :on-close
-               (lambda (_p)
-                 (when (and herdr-sanctum--sub-ack-time
-                            (> (- (float-time) herdr-sanctum--sub-ack-time)
-                               herdr-sanctum-reconnect-interval))
-                   (setq herdr-sanctum--events-lost-retry-count 0))
+          (progn
+            (herdr-sanctum--clear-stale-snapshot)
+            (herdr-sanctum--schedule-reconnect))
+        (setq herdr-sanctum--sub-ack-time nil)
+        (if (herdr-sanctum--open-subscription
+             :name "herdr-sanctum-events"
+             :sock sock
+             :id "emacs:sub"
+             :subscriptions (vconcat
+                             (mapcar (lambda (typ) `((type . ,typ)))
+                                     herdr-sanctum--subscriptions))
+             :proc-var 'herdr-sanctum--sub-process
+             :on-error
+             (lambda (proc err)
+               (let* ((fast (equal (alist-get 'code err) "events_lost"))
+                      (ack-time herdr-sanctum--sub-ack-time)
+                      (delay nil))
                  (setq herdr-sanctum--sub-ack-time nil)
+                 (when fast
+                   (when (and ack-time
+                              (> (- (float-time) ack-time)
+                                 herdr-sanctum-reconnect-interval))
+                     (setq herdr-sanctum--events-lost-retry-count 0))
+                   (setq delay (min herdr-sanctum-reconnect-interval
+                                    (* 0.25 (expt 2 (min herdr-sanctum--events-lost-retry-count 5)))))
+                   (cl-incf herdr-sanctum--events-lost-retry-count))
+                 (setq herdr-sanctum--sub-process nil
+                       herdr-sanctum--connected-socket-path nil)
                  (herdr-sanctum--close-agent-subscription)
-                 (herdr-sanctum--schedule-reconnect)))
+                 (when (process-live-p proc)
+                   (delete-process proc))
+                 (unless (or fast (file-exists-p (herdr-sanctum-socket-path)))
+                   (herdr-sanctum--clear-stale-snapshot))
+                 (herdr-sanctum--schedule-reconnect delay)))
+             :on-ack
+             (lambda ()
+               (setq herdr-sanctum--sub-ack-time (float-time)
+                     herdr-sanctum--reconnect-attempt 0))
+             :on-close
+             (lambda (p)
+               (when (and herdr-sanctum--sub-ack-time
+                          (> (- (float-time) herdr-sanctum--sub-ack-time)
+                             herdr-sanctum-reconnect-interval))
+                 (setq herdr-sanctum--events-lost-retry-count 0))
+               (setq herdr-sanctum--sub-ack-time nil
+                     herdr-sanctum--connected-socket-path nil)
+               (herdr-sanctum--close-agent-subscription)
+               (let ((target (herdr-sanctum-socket-path)))
+                 (when (or (not (file-exists-p target))
+                           (not (equal (process-get p 'herdr-sanctum-socket-path) target))
+                           (>= herdr-sanctum--reconnect-attempt 1)
+                           (not (herdr-sanctum-any-ui-buffer-live-p)))
+                   (herdr-sanctum--clear-stale-snapshot)))
+               (herdr-sanctum--schedule-reconnect)))
             (progn
+              (setq herdr-sanctum--connected-socket-path sock)
               (when (timerp herdr-sanctum--reconnect-timer)
                 (cancel-timer herdr-sanctum--reconnect-timer)
                 (setq herdr-sanctum--reconnect-timer nil))
               (herdr-sanctum--ensure-duration-timer)
               (herdr-sanctum-request-snapshot force))
-            (herdr-sanctum--schedule-reconnect)))))))
+          (herdr-sanctum--clear-stale-snapshot)
+          (herdr-sanctum--schedule-reconnect))))))
 
+;;;###autoload
 (defun herdr-sanctum-disconnect ()
   "Tear down Herdr socket subscriptions and clear in-memory cached state."
+  (interactive)
   (when (timerp herdr-sanctum--refresh-timer)
     (cancel-timer herdr-sanctum--refresh-timer)
     (setq herdr-sanctum--refresh-timer nil))
@@ -1000,7 +1150,8 @@ Optional FORCE is passed through to `herdr-sanctum-request-snapshot'."
   (setq herdr-sanctum--timestamps-socket nil)
   (herdr-sanctum--abort-snapshot t)
   (let ((proc herdr-sanctum--sub-process))
-    (setq herdr-sanctum--sub-process nil)
+    (setq herdr-sanctum--sub-process nil
+          herdr-sanctum--connected-socket-path nil)
     (when (process-live-p proc)
       (delete-process proc)))
   (setq herdr-sanctum--snapshot nil
@@ -1008,9 +1159,12 @@ Optional FORCE is passed through to `herdr-sanctum-request-snapshot'."
         herdr-sanctum--ws-dir-cache nil
         herdr-sanctum--events-lost-retry-count 0
         herdr-sanctum--sub-ack-time nil
+        herdr-sanctum--reconnect-attempt 0
         herdr-sanctum--last-focus-key nil)
   (run-hooks 'herdr-sanctum-disconnect-hook)
-  (force-mode-line-update t))
+  (force-mode-line-update t)
+  (when (called-interactively-p 'interactive)
+    (message "Disconnected from Herdr")))
 
 (defun herdr-sanctum-maybe-disconnect-on-kill ()
   "Disconnect from Herdr when the last Sanctum UI buffer is killed."
@@ -1030,9 +1184,11 @@ Optional FORCE is passed through to `herdr-sanctum-request-snapshot'."
   "Manually refresh Sanctum working directory and agent status from Herdr."
   (interactive)
   (cond
-   ((process-live-p herdr-sanctum--sub-process)
+   ((and (process-live-p herdr-sanctum--sub-process)
+         (not (herdr-sanctum--socket-changed-p (herdr-sanctum-socket-path))))
     (herdr-sanctum-request-snapshot t))
-   ((herdr-sanctum-any-ui-buffer-live-p)
+   ((or (process-live-p herdr-sanctum--sub-process)
+        (herdr-sanctum-any-ui-buffer-live-p))
     (herdr-sanctum-ensure-connected t))
    (t
     (user-error "Sanctum is not open; run `herdr-sanctum' first"))))

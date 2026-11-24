@@ -33,12 +33,19 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'face-remap)
 (require 'subr-x)
 (require 'herdr-sanctum-theme)
 (require 'herdr-sanctum-rpc)
 
+(declare-function evil-set-initial-state "evil" (mode state))
 (declare-function truncate-string-pixelwise "subr-x"
                   (string max-pixels &optional buffer ellipsis ellipsis-pixels))
+(declare-function tab-bar--current-tab "tab-bar" (&optional frame))
+(declare-function tab-bar-new-tab "tab-bar" (&optional arg to-index))
+(declare-function tab-bar-switch-to-recent-tab "tab-bar" (&optional arg))
+(declare-function tab-bar-tabs "tab-bar" (&optional frame))
+(defvar hl-line-sticky-flag)
 
 (defgroup herdr-sanctum-ui nil
   "Shared side-panel layout and chrome widgets for `herdr-sanctum'."
@@ -63,6 +70,12 @@ Defaults to `herdr-sanctum--panel-render-fn' when nil.")
 
 (defvar-local herdr-sanctum--ellipsis-px-cache nil
   "Cached `(KEY . ALIST)' mapping BG-FACE to ellipsis pixel width.")
+
+(defvar-local herdr-sanctum--panel-remap-cookies nil
+  "List of `face-remap-add-relative' cookies managed by Sanctum in a panel.")
+
+(defvar herdr-sanctum--evil-registered-modes nil
+  "List of major mode symbols registered via `herdr-sanctum-configure-evil-mode'.")
 
 (defun herdr-sanctum--resolve-buffer (&optional buf-or-name)
   "Return live buffer for BUF-OR-NAME (default current buffer), or nil."
@@ -94,16 +107,177 @@ Defaults to `herdr-sanctum--panel-render-fn' when nil.")
   "Horizontal fringe width in pixels on graphical Sanctum side panels.
 Applied symmetrically to left and right fringes of `*sanctum-spaces*' and
 `*sanctum-drawer*' (with zero window margins) so panel padding inherits
-`bg-chrome' seamlessly."
+`bg-panel' seamlessly."
   :type 'natnum
   :group 'herdr-sanctum-ui
   :set #'herdr-sanctum--set-panel-fringe-width)
 
-(defcustom herdr-sanctum-open-outside-function nil
+(defun herdr-sanctum--set-panel-line-spacing (sym val)
+  "Set `herdr-sanctum-panel-line-spacing' SYM to VAL and update live panels."
+  (set-default sym val)
+  (when (featurep 'herdr-sanctum-ui)
+    (dolist (name (list herdr-sanctum-sidebar-buffer-name
+                        herdr-sanctum-drawer-buffer-name))
+      (when-let* ((buf (get-buffer name)))
+        (with-current-buffer buf
+          (setq-local line-spacing val))))))
+
+(defcustom herdr-sanctum-panel-line-spacing 0.22
+  "Buffer-local `line-spacing' used in Sanctum side-panel buffers.
+Applied to `*sanctum-spaces*' and `*sanctum-drawer*'."
+  :type '(choice (const :tag "Default" nil)
+                 (number :tag "Line spacing"))
+  :group 'herdr-sanctum
+  :set #'herdr-sanctum--set-panel-line-spacing)
+
+(defun herdr-sanctum--set-evil-initial-state (sym val)
+  "Set `herdr-sanctum-evil-initial-state' SYM to VAL and re-apply to modes."
+  (set-default sym val)
+  (when (and (featurep 'herdr-sanctum-ui)
+             val
+             (fboundp 'evil-set-initial-state))
+    (dolist (mode herdr-sanctum--evil-registered-modes)
+      (evil-set-initial-state mode val))))
+
+(defcustom herdr-sanctum-evil-initial-state 'emacs
+  "Initial Evil state used in Sanctum side-panel buffers.
+Applies to major modes registered via `herdr-sanctum-configure-evil-mode'
+when `evil' is loaded.  Set to nil to leave Evil's default state untouched."
+  :type '(choice (const :tag "Emacs state (use Sanctum's Vi/Emacs keys)" emacs)
+                 (const :tag "Evil motion state" motion)
+                 (const :tag "Evil normal state" normal)
+                 (const :tag "Do not configure Evil" nil))
+  :group 'herdr-sanctum
+  :set #'herdr-sanctum--set-evil-initial-state)
+
+(defun herdr-sanctum--apply-evil-state-all ()
+  "Apply `herdr-sanctum-evil-initial-state' to all registered panel modes."
+  (when (and herdr-sanctum-evil-initial-state
+             (fboundp 'evil-set-initial-state))
+    (dolist (mode herdr-sanctum--evil-registered-modes)
+      (evil-set-initial-state mode herdr-sanctum-evil-initial-state))))
+
+(defun herdr-sanctum-configure-evil-mode (mode)
+  "Register major MODE to use `herdr-sanctum-evil-initial-state' under Evil.
+Applies immediately when `evil-set-initial-state' is already defined, or
+defers until `evil' is loaded."
+  (cl-pushnew mode herdr-sanctum--evil-registered-modes :test #'eq)
+  (if (fboundp 'evil-set-initial-state)
+      (when herdr-sanctum-evil-initial-state
+        (evil-set-initial-state mode herdr-sanctum-evil-initial-state))
+    (eval-after-load 'evil #'herdr-sanctum--apply-evil-state-all)))
+
+(defun herdr-sanctum--set-hide-scroll-bars (sym val)
+  "Set `herdr-sanctum-hide-scroll-bars' SYM to VAL and refresh Sanctum windows."
+  (set-default sym val)
+  (when (and (featurep 'herdr-sanctum-ui)
+             (fboundp 'herdr-sanctum-apply-window-scroll-bars))
+    (dolist (name (herdr-sanctum-ui-buffers))
+      (when-let* ((buf (get-buffer name)))
+        (dolist (win (get-buffer-window-list buf nil t))
+          (herdr-sanctum-apply-window-scroll-bars win))))
+    (when (fboundp 'herdr-sanctum-panel-refresh-or-mark-dirty)
+      (dolist (name (list herdr-sanctum-sidebar-buffer-name
+                          herdr-sanctum-drawer-buffer-name))
+        (herdr-sanctum-panel-refresh-or-mark-dirty name)))))
+
+(defcustom herdr-sanctum-hide-scroll-bars t
+  "When non-nil, hide scroll bars locally on Sanctum windows on GUI frames.
+Applies per-window via `set-window-scroll-bars' without altering global
+`scroll-bar-mode'."
+  :type 'boolean
+  :group 'herdr-sanctum-ui
+  :set #'herdr-sanctum--set-hide-scroll-bars)
+
+(defun herdr-sanctum-apply-window-scroll-bars (window)
+  "Apply `herdr-sanctum-hide-scroll-bars' locally to live WINDOW."
+  (when (and (window-live-p window)
+             (display-graphic-p (window-frame window)))
+    (if herdr-sanctum-hide-scroll-bars
+        (set-window-scroll-bars window 0 nil 0 nil)
+      (set-window-scroll-bars window nil nil nil nil))))
+
+(defcustom herdr-sanctum-min-terminal-width 40
+  "Minimum center terminal columns to keep when toggling opposite side panels.
+When non-nil and toggling a side panel open on a narrow frame would squeeze
+the center area below this width, automatically collapse the opposite side
+panel.  Set to nil to always allow both side panels simultaneously."
+  :type '(choice (const :tag "Disable auto-collapse" nil)
+                 (integer :tag "Minimum columns"))
+  :group 'herdr-sanctum-ui)
+
+(defun herdr-sanctum-invoke-command-or-fn (fn &rest args)
+  "Invoke FN with ARGS, using `call-interactively' for commands requiring args.
+When ARGS is nil and FN is an interactive command whose minimum arity is
+positive (such as `find-file' or `vc-root-diff'), invoke it via
+`call-interactively' so interactive arguments are prompted instead of
+signaling `wrong-number-of-arguments'.  Otherwise call `(apply fn args)'."
+  (if (and (null args)
+           (commandp fn)
+           (let ((arity (ignore-errors (func-arity fn))))
+             (and (consp arity)
+                  (numberp (car arity))
+                  (> (car arity) 0))))
+      (call-interactively fn)
+    (apply fn args)))
+
+(defun herdr-sanctum-default-open-outside (fn dir)
+  "Default outside-opening dispatcher running FN with `default-directory' DIR.
+When `herdr-sanctum-display-mode' is `tab', `tab-bar-mode' is active,
+`herdr-sanctum-tab-routing-mode' has no active rules or fallback tab, and
+the active window belongs to the dedicated Sanctum tab, switch to the
+previous tab (or create a new tab if Sanctum is the sole tab) before
+running FN so `*sanctum*' remains unsplit.
+When `herdr-sanctum-display-mode' is `frame' and the selected frame is the
+dedicated Sanctum frame, focus the most recently used visible non-Sanctum
+frame (or create a new frame) before running FN."
+  (let ((target-dir (or dir default-directory)))
+    (cond
+     ((and (eq (bound-and-true-p herdr-sanctum-display-mode) 'tab)
+           (bound-and-true-p tab-bar-mode)
+           (not (and (bound-and-true-p herdr-sanctum-tab-routing-mode)
+                     (or (bound-and-true-p herdr-sanctum-tab-routing-rules)
+                         (bound-and-true-p herdr-sanctum-tab-routing-fallback-tab))))
+           (member (buffer-name (window-buffer)) (herdr-sanctum-ui-buffers))
+           (let ((tab-name (bound-and-true-p herdr-sanctum-tab-name)))
+             (and tab-name
+                  (equal (alist-get 'name (tab-bar--current-tab)) tab-name))))
+      (if (> (length (tab-bar-tabs)) 1)
+          (tab-bar-switch-to-recent-tab)
+        (tab-bar-new-tab)))
+     ((and (eq (bound-and-true-p herdr-sanctum-display-mode) 'frame)
+           (let ((frame-name (bound-and-true-p herdr-sanctum-frame-name)))
+             (and frame-name
+                  (equal (frame-parameter (selected-frame) 'name) frame-name))))
+      (let ((cur-frame (selected-frame))
+            (frame-name (bound-and-true-p herdr-sanctum-frame-name))
+            (best nil)
+            (best-time nil))
+        (dolist (f (frame-list))
+          (when (and (not (eq f cur-frame))
+                     (eq (frame-visible-p f) t)
+                     (not (frame-parameter f 'parent-frame))
+                     (not (eq (frame-parameter f 'minibuffer) 'only))
+                     (not (equal (frame-parameter f 'name) frame-name)))
+            (let* ((win (ignore-errors (frame-selected-window f)))
+                   (use-time (if (and win (window-live-p win))
+                                 (or (ignore-errors (window-use-time win)) 0)
+                               0)))
+              (when (or (null best) (> use-time best-time))
+                (setq best f
+                      best-time use-time)))))
+        (select-frame-set-input-focus (or best (make-frame))))))
+    (let ((default-directory target-dir))
+      (herdr-sanctum-invoke-command-or-fn fn))))
+
+(defcustom herdr-sanctum-open-outside-function #'herdr-sanctum-default-open-outside
   "Function `(FN DIR)' used when opening files or Git views from Sanctum.
-When nil, simply call FN with `default-directory' bound to DIR.
-Set this to switch tabs or frames before opening code, Magit, or diffs."
-  :type '(choice (const :tag "Default (current context)" nil)
+Defaults to `herdr-sanctum-default-open-outside', which switches away from
+the dedicated Sanctum tab (in `tab' mode without active routing rules or
+fallback) or Sanctum frame (in `frame' mode).  When nil, simply invoke FN
+via `herdr-sanctum-invoke-command-or-fn' with `default-directory' bound
+to DIR."
+  :type '(choice (const :tag "Current context (no routing)" nil)
                  (function :tag "Custom dispatcher"))
   :group 'herdr-sanctum-ui)
 
@@ -113,7 +287,7 @@ Set this to switch tabs or frames before opening code, Magit, or diffs."
     (if (functionp herdr-sanctum-open-outside-function)
         (funcall herdr-sanctum-open-outside-function fn target-dir)
       (let ((default-directory target-dir))
-        (funcall fn)))))
+        (herdr-sanctum-invoke-command-or-fn fn)))))
 
 ;;; Face Remapping & Panel Lifecycle
 
@@ -125,7 +299,7 @@ Set this to switch tabs or frames before opening code, Magit, or diffs."
 
 (defun herdr-sanctum-ui-remapping (bg hl &optional var-family)
   "Build buffer `face-remapping-alist' for Sanctum sidebars and drawers.
-BG is the chrome background color, HL is the `hl-line' background, and
+BG is the panel background color, HL is the `hl-line' background, and
 VAR-FAMILY overrides the UI font family when provided.  When
 `herdr-sanctum-ui-font-height' is a relative float, neutralizes compound
 scaling on `herdr-sanctum-chrome-bar' and `herdr-sanctum-status-bar' so
@@ -163,17 +337,38 @@ Preserves all non-header-line entries in `face-remapping-alist'."
                     (append (copy-alist herdr-sanctum-header-line-remapping)
                             others))))))
 
+(defun herdr-sanctum-apply-panel-remapping (&optional buf bg hl var-family)
+  "Apply Sanctum side-panel face remappings non-destructively to BUF.
+BUF may be a buffer, buffer name, or nil (defaulting to the current buffer).
+Optional BG, HL, and VAR-FAMILY override the panel background color
+defaulting to `bg-panel' (falling back to `bg-chrome'), `hl-line'
+background (`bg-hl'), and UI font family.  Removes only previously managed
+`herdr-sanctum--panel-remap-cookies' so user `text-scale-mode',
+`buffer-face-mode', and custom `face-remap-add-relative' entries survive
+theme changes."
+  (when-let* ((target (herdr-sanctum--resolve-buffer buf)))
+    (let ((panel-bg (or bg
+                        (herdr-sanctum-palette-color 'bg-panel)
+                        (herdr-sanctum-palette-color 'bg-chrome)))
+          (hl-bg (or hl (herdr-sanctum-palette-color 'bg-hl))))
+      (with-current-buffer target
+        (dolist (cookie herdr-sanctum--panel-remap-cookies)
+          (face-remap-remove-relative cookie))
+        (setq herdr-sanctum--panel-remap-cookies nil)
+        (dolist (entry (herdr-sanctum-ui-remapping panel-bg hl-bg var-family))
+          (push (face-remap-add-relative (car entry) (cadr entry))
+                herdr-sanctum--panel-remap-cookies))))))
+
 (defun herdr-sanctum--sync-buffer-remappings ()
   "Update `face-remapping-alist' on live Sanctum UI and terminal buffers."
-  (let ((bg (herdr-sanctum-palette-color 'bg-chrome))
+  (let ((bg (or (herdr-sanctum-palette-color 'bg-panel)
+                (herdr-sanctum-palette-color 'bg-chrome)))
         (hl (herdr-sanctum-palette-color 'bg-hl))
         (var-family (herdr-sanctum-ui-font-family)))
     (dolist (name (list herdr-sanctum-sidebar-buffer-name
                         herdr-sanctum-drawer-buffer-name))
       (when-let* ((buf (get-buffer name)))
-        (with-current-buffer buf
-          (setq-local face-remapping-alist
-                      (herdr-sanctum-ui-remapping bg hl var-family)))))
+        (herdr-sanctum-apply-panel-remapping buf bg hl var-family)))
     (when-let* ((term-buf (get-buffer herdr-sanctum-buffer-name)))
       (herdr-sanctum-apply-terminal-header-remapping term-buf))))
 
@@ -206,7 +401,8 @@ and fringes immediately."
                                          (copy-alist fringe-indicator-alist)))))
     (when-let* ((target (or win (get-buffer-window buf frame))))
       (set-window-margins target 0 0)
-      (set-window-fringes target fringe fringe))))
+      (set-window-fringes target fringe fringe)
+      (herdr-sanctum-apply-window-scroll-bars target))))
 
 (defun herdr-sanctum-panel-window (&optional buf)
   "Return the preferred live window displaying BUF (default current buffer).
@@ -291,17 +487,16 @@ dirty render is flushed when the panel becomes displayed."
   (setq-local truncate-lines t
               cursor-type nil
               cursor-in-non-selected-windows nil
+              hl-line-sticky-flag nil
               mode-line-format nil
               header-line-format nil
-              line-spacing 0.22
+              line-spacing herdr-sanctum-panel-line-spacing
               herdr-sanctum--panel-render-fn render-fn
               herdr-sanctum--panel-size-change-fn (or on-size-change-fn render-fn)
               herdr-sanctum--panel-after-flush-fn on-flush-fn)
   (herdr-sanctum-apply-panel-padding)
   (hl-line-mode 1)
-  (let ((bg (herdr-sanctum-palette-color 'bg-chrome))
-        (hl (herdr-sanctum-palette-color 'bg-hl)))
-    (setq-local face-remapping-alist (herdr-sanctum-ui-remapping bg hl)))
+  (herdr-sanctum-apply-panel-remapping)
   (add-hook 'kill-buffer-hook #'herdr-sanctum-maybe-disconnect-on-kill nil t)
   (add-hook 'window-size-change-functions
             #'herdr-sanctum--panel-on-window-size-change nil t)
@@ -322,6 +517,7 @@ the same SIDE stack instead of evicting each other."
                    (side . ,side)
                    (slot . ,(or slot 0))
                    (window-width . ,width)
+                   (preserve-size . (t . nil))
                    (dedicated . t)
                    (window-parameters . ((no-delete-other-windows . t))))))
     (with-current-buffer buf
@@ -330,6 +526,7 @@ the same SIDE stack instead of evicting each other."
     (let ((win (display-buffer buf action)))
       (when (window-live-p win)
         (herdr-sanctum-apply-panel-padding win)
+        (window-preserve-size win t t)
         (set-window-dedicated-p win t))
       (with-current-buffer buf
         (setq herdr-sanctum--panel-dirty nil)
@@ -380,6 +577,31 @@ and force a mode-line update.  Return the shown window on open, or nil."
       (when (and (window-live-p win) (eq (window-deletable-p win) t))
         (delete-window win)))
     (kill-buffer buf)))
+
+(defun herdr-sanctum-maybe-collapse-opposite-panel
+    (opening-side opening-width other-buffer-name other-side &optional on-collapse-fn)
+  "Collapse OTHER-BUFFER-NAME on narrow frames before opening OPENING-SIDE.
+OPENING-WIDTH is the target column width of the panel being opened, and
+OTHER-SIDE is the configured side of OTHER-BUFFER-NAME.  When opposite-side
+panels would leave fewer than `herdr-sanctum-min-terminal-width' columns on
+the selected frame, delete the opposite panel's window and invoke optional
+ON-COLLAPSE-FN."
+  (when (numberp herdr-sanctum-min-terminal-width)
+    (when-let* ((other-buf (get-buffer other-buffer-name))
+                (other-win (get-buffer-window other-buf (selected-frame)))
+                ((window-live-p other-win))
+                ((not (eq opening-side
+                          (or (window-parameter other-win 'window-side)
+                              other-side))))
+                ((eq (window-deletable-p other-win) t))
+                (avail (- (frame-width (selected-frame))
+                          opening-width
+                          (window-total-width other-win)))
+                ((< avail herdr-sanctum-min-terminal-width)))
+      (delete-window other-win)
+      (when (functionp on-collapse-fn)
+        (funcall on-collapse-fn))
+      t)))
 
 ;;; Shared Side-Panel Controller Helpers
 
@@ -575,6 +797,43 @@ When VERBOSE is non-nil, format as `↑N ahead · ↓N behind'."
     (let ((ellipsis (if bg-face (propertize "…" 'face bg-face) "…")))
       (truncate-string-to-width text max-width nil nil ellipsis))))
 
+(defun herdr-sanctum-truncate-path (path width &optional win face)
+  "Truncate file PATH to fit WIDTH/WIN while preserving trailing segments.
+Optional FACE styles the returned string and governs pixel measurement."
+  (let* ((styled (if face (propertize path 'face face) path))
+         (gui-p (and (window-live-p win)
+                     (display-graphic-p (window-frame win))
+                     (fboundp 'string-pixel-width)))
+         (limit (if gui-p (herdr-sanctum-usable-body-px win 80) (max 1 width)))
+         (buf (current-buffer))
+         (fits-p (lambda (s)
+                   (if gui-p
+                       (<= (herdr-sanctum-string-pixel-width s buf) limit)
+                     (<= (string-width s) limit)))))
+    (if (funcall fits-p styled)
+        styled
+      (let* ((trimmed (directory-file-name path))
+             (parts (split-string trimmed "/" t))
+             (best nil))
+        (when (> (length parts) 1)
+          (let ((acc nil))
+            (dolist (seg (nreverse parts))
+              (push seg acc)
+              (let* ((cand (concat "…/" (string-join acc "/")))
+                     (cand-s (if face (propertize cand 'face face) cand)))
+                (when (funcall fits-p cand-s)
+                  (setq best cand-s))))))
+        (or best
+            (let* ((tail (file-name-nondirectory trimmed))
+                   (short (if (and (not (string-empty-p tail))
+                                   (not (equal tail trimmed)))
+                              (concat "…/" tail)
+                            path))
+                   (short-s (if face (propertize short 'face face) short)))
+              (if gui-p
+                  (herdr-sanctum-truncate-px short-s limit face)
+                (herdr-sanctum-truncate short-s limit face))))))))
+
 (defun herdr-sanctum-truncate-px (text max-px &optional bg-face)
   "Truncate propertized TEXT to fit within MAX-PX pixels on graphical frames."
   (cond
@@ -583,7 +842,14 @@ When VERBOSE is non-nil, format as `↑N ahead · ↓N behind'."
     (let* ((buf (current-buffer))
            (ellipsis (if bg-face (propertize "…" 'face bg-face) "…"))
            (ell-px (herdr-sanctum--ellipsis-px ellipsis bg-face buf)))
-      (if (fboundp 'truncate-string-pixelwise)
+      ;; Emacs's C `truncate-string-pixelwise' wraps internally against the
+      ;; selected window's width; skip it when the selected window is narrower
+      ;; than `max-px + ell-px' so wider side panels never lose truncation.
+      (if (and (fboundp 'truncate-string-pixelwise)
+               (let ((sel (selected-window)))
+                 (and (window-live-p sel)
+                      (display-graphic-p (window-frame sel))
+                      (< (+ max-px ell-px) (window-body-width sel t)))))
           (truncate-string-pixelwise text max-px buf ellipsis ell-px)
         (cond
          ((<= (herdr-sanctum-string-pixel-width text buf) max-px)
@@ -740,6 +1006,28 @@ literal `%' characters via `herdr-sanctum-escape-mode-line'."
               (herdr-sanctum--pad-row
                left-str right-str width 'herdr-sanctum-chrome-bar)))))
     (herdr-sanctum-escape-mode-line result)))
+
+(defun herdr-sanctum-format-status-bar (left right &optional win)
+  "Return a `mode-line-format' list aligning LEFT and RIGHT with WIN's fringes.
+LEFT and RIGHT should already be propertized with `herdr-sanctum-status-bar'
+(or a compatible button face) without leading or trailing padding spaces."
+  (let* ((w (and (window-live-p win) win))
+         (gui-p (and w (display-graphic-p (window-frame w))))
+         (fringe-l (if gui-p (or (nth 0 (window-fringes w)) 0) 0))
+         (fringe-r (if gui-p (or (nth 1 (window-fringes w)) 0) 0))
+         (lead (if (> fringe-l 0)
+                   (propertize " "
+                               'display '(space :align-to (0))
+                               'face 'herdr-sanctum-status-bar)
+                 (propertize " " 'face 'herdr-sanctum-status-bar)))
+         (tail (if (> fringe-r 0)
+                   (propertize " "
+                               'display `(space :width (,fringe-r))
+                               'face 'herdr-sanctum-status-bar)
+                 (propertize " " 'face 'herdr-sanctum-status-bar))))
+    (list (concat lead left)
+          'mode-line-format-right-align
+          (concat right tail))))
 
 (defun herdr-sanctum-make-chrome-button
     (label area fn &optional face help-echo cache-key)

@@ -1,4 +1,4 @@
-;;; herdr-sanctum-theme.el --- Faces, palette, SVG icons & layout helpers -*- lexical-binding: t; -*-
+;;; herdr-sanctum-theme.el --- Faces, palette, and SVG icons for herdr-sanctum -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 oatiz
 
@@ -23,36 +23,84 @@
 
 ;;; Commentary:
 
-;; Theme-adaptive faces, palette token resolution (Modus, Ef, and generic
-;; dark/light color derivation), inline SVG space monograms and coding-agent
-;; badges (with pure-text TTY fallback), and pixel-exact row formatting.
+;; Pure theme layer for `herdr-sanctum': semantic palette token resolution
+;; (Modus, Ef, and generic dark/light color derivation), palette-driven chrome
+;; faces, and inline SVG/Unicode badges for spaces and coding agents.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'color)
+(eval-when-compile (require 'let-alist))
 (require 'seq)
 (require 'subr-x)
-(require 'herdr-sanctum-rpc)
 
 (declare-function ef-themes-get-color-value "ef-themes" (color &optional overrides theme))
 (declare-function modus-themes-get-color-value "modus-themes" (color &optional overrides theme))
 (declare-function svg-create "svg" (width height &rest args))
 (declare-function svg-circle "svg" (svg x y radius &rest args))
 (declare-function svg-image "svg" (svg &rest props))
-(declare-function svg-line "svg" (svg x1 y1 x2 y2 &rest args))
-(declare-function svg-polygon "svg" (svg points &rest args))
-(declare-function svg-polyline "svg" (svg points &rest args))
 (declare-function svg-rectangle "svg" (svg x y width height &rest args))
 (declare-function svg-text "svg" (svg text &rest args))
+
+(defgroup herdr-sanctum-theme nil
+  "Faces, palette derivation, and SVG icons for `herdr-sanctum'."
+  :group 'herdr-sanctum
+  :prefix "herdr-sanctum-")
+
+(defvar herdr-sanctum-theme-revision 0
+  "Monotonic revision incremented whenever Sanctum theme faces or icons change.")
+
+(defvar herdr-sanctum-theme-change-hook nil
+  "Hook run after theme application or icon options update Sanctum visuals.")
+
+(defvar herdr-sanctum--svg-cache (make-hash-table :test #'equal)
+  "Cache of rendered inline SVG images for space monograms and agent glyphs.")
+
+(defvar herdr-sanctum--svg-file-cache (make-hash-table :test #'equal)
+  "Cache of raw SVG strings loaded from `herdr-sanctum-agent-icon-directory'.")
+
+(defvar herdr-sanctum--palette-cache (make-hash-table :test #'equal)
+  "Cache of resolved default palette colors keyed by `(BG-MODE . TOKEN)'.")
+
+(defvar herdr-sanctum--last-theme-state nil
+  "Last theme state snapshot applied by `herdr-sanctum-apply-theme'.")
+
+(defvar herdr-sanctum-space-badge-palette
+  '(("#2a6b68" . "#e4f7f5")
+    ("#8a5f2f" . "#fdf1e0")
+    ("#5458a6" . "#eceeff")
+    ("#3a7852" . "#e4f7ea")
+    ("#944568" . "#fde8f1")
+    ("#3a639c" . "#e8f1ff"))
+  "Muted `(BG . FG)' color pairs used for Space monogram badges.")
+
+(defun herdr-sanctum--set-theme-option (sym val)
+  "Set visual option SYM to VAL and re-apply Sanctum faces when loaded."
+  (set-default sym val)
+  (when (and (featurep 'herdr-sanctum-theme)
+             (fboundp 'herdr-sanctum-apply-theme))
+    (herdr-sanctum-apply-theme t)))
+
+(defun herdr-sanctum--set-icon-option (sym val)
+  "Set icon option SYM to VAL, clear SVG caches, and notify panels."
+  (set-default sym val)
+  (when (boundp 'herdr-sanctum--svg-cache)
+    (clrhash herdr-sanctum--svg-cache))
+  (when (boundp 'herdr-sanctum--svg-file-cache)
+    (clrhash herdr-sanctum--svg-file-cache))
+  (when (featurep 'herdr-sanctum-theme)
+    (cl-incf herdr-sanctum-theme-revision)
+    (run-hooks 'herdr-sanctum-theme-change-hook)))
 
 (defcustom herdr-sanctum-palette-function #'herdr-sanctum-default-palette-color
   "Function `(TOKEN FALLBACK)' resolving semantic palette colors.
 Supported tokens include `bg-chrome', `bg-card', `bg-hl', `bg-selected',
 `bg-pill-active', `border', `guide', `accent', `fg-main', `fg-dim',
-`fg-alt', `yellow', `red', `green', `cyan', `magenta', and `red-warmer'."
+`fg-alt', `yellow', `red', and `green'."
   :type 'function
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-theme-option)
 
 (defcustom herdr-sanctum-ui-font nil
   "Font family used for Sanctum graphical chrome (sidebar, drawer, top bar).
@@ -62,12 +110,8 @@ font family name string."
   :type '(choice (const :tag "Auto (variable-pitch)" nil)
                  (const :tag "Default monospace" default)
                  (string :tag "Font family"))
-  :group 'herdr-sanctum)
-
-(defcustom herdr-sanctum-ui-font-candidates nil
-  "Fallback font family names tried when `variable-pitch' is unspecified."
-  :type '(repeat string)
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-theme-option)
 
 (defcustom herdr-sanctum-ui-font-height 0.9
   "Height for Sanctum chrome UI text.
@@ -75,51 +119,26 @@ May be a floating-point scale relative to `default' (for example 0.9) or an
 integer in 1/10pt units (for example 110)."
   :type '(choice (float :tag "Relative scale")
                  (integer :tag "Absolute 1/10pt"))
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-theme-option)
 
 (defcustom herdr-sanctum-space-badge-style 'svg
   "Rendering style for Space monogram badges in the sidebar and drawer."
   :type '(choice (const :tag "Inline SVG monogram" svg)
                  (const :tag "Text monogram" text)
                  (const :tag "None" none))
-  :group 'herdr-sanctum)
-
-(defcustom herdr-sanctum-space-badge-palette
-  '(("#2a6b68" . "#e4f7f5")
-    ("#8a5f2f" . "#fdf1e0")
-    ("#5458a6" . "#eceeff")
-    ("#3a7852" . "#e4f7ea")
-    ("#944568" . "#fde8f1")
-    ("#3a639c" . "#e8f1ff"))
-  "Muted `(BG . FG)' color pairs used for Space monogram badges."
-  :type '(repeat (cons (color :tag "Background") (color :tag "Foreground")))
-  :group 'herdr-sanctum)
-
-(defvar herdr-sanctum--svg-cache (make-hash-table :test #'equal)
-  "Cache of rendered inline SVG images for space monograms and agent glyphs.")
-
-(defvar herdr-sanctum--svg-file-cache (make-hash-table :test #'equal)
-  "Cache of raw SVG strings loaded from `herdr-sanctum-agent-icon-directory'.")
-
-(defcustom herdr-sanctum-theme-change-hook nil
-  "Hook run after `herdr-sanctum-apply-theme' updates Sanctum faces."
-  :type 'hook
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-icon-option)
 
 (defcustom herdr-sanctum-agent-icon-style 'svg-files
   "Icon rendering backend for Herdr coding-agent rows.
-`builtin' renders crisp 14x14 geometric SVGs via `svg.el'; `svg-files'
-loads static SVGs from `herdr-sanctum-agent-icon-directory' with automatic
-fallback to `builtin'; `unicode' always uses plain Unicode glyphs."
+`svg-files' loads static SVGs from `herdr-sanctum-agent-icon-directory' with
+automatic fallback to a 1-letter SVG monogram; `unicode' always uses plain
+Unicode glyphs."
   :type '(choice (const :tag "Static SVG files" svg-files)
-                 (const :tag "Built-in geometric SVG" builtin)
                  (const :tag "Plain Unicode glyphs" unicode))
-  :group 'herdr-sanctum
-  :set (lambda (sym val)
-         (set-default sym val)
-         (when (boundp 'herdr-sanctum--svg-cache)
-           (clrhash herdr-sanctum--svg-cache))
-         (run-hooks 'herdr-sanctum-theme-change-hook)))
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-icon-option)
 
 (defcustom herdr-sanctum-agent-icon-directory
   (let* ((src (or load-file-name (locate-library "herdr-sanctum-theme")))
@@ -127,155 +146,147 @@ fallback to `builtin'; `unicode' always uses plain Unicode glyphs."
     (and base (expand-file-name "assets/agents" base)))
   "Directory containing `<agent>.svg' static icons for `svg-files' style."
   :type '(choice (const :tag "None" nil) directory)
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-icon-option)
 
 (defcustom herdr-sanctum-agent-brands
-  '(("claude"         . (:color red-warmer :fallback "#de8e80"))
-    ("claude-code"    . (:color red-warmer :fallback "#de8e80" :file "claude"))
-    ("pi"             . (:color accent     :fallback "#82aaff"))
-    ("codex"          . (:color cyan       :fallback "#7dc2b8"))
-    ("gemini"         . (:color magenta    :fallback "#b4a4e6"))
-    ("qwen-code"      . (:color fg-alt     :fallback "#a6b2d4" :file "qwen"))
-    ("github-copilot" . (:color fg-alt     :fallback "#a6b2d4" :file "copilot")))
-  "Alist mapping canonical agent names to brand color and SVG file metadata.
+  '(("pi"             . (:color accent))
+    ("claude-code"    . (:file "claude"))
+    ("qwen-code"      . (:file "qwen"))
+    ("github-copilot" . (:file "copilot")))
+  "Alist mapping canonical agent names to brand tint and SVG alias metadata.
 Each entry is `(NAME . PLIST)' where PLIST supports:
-  `:color'    -- semantic palette token symbol or hex color string
-  `:fallback' -- fallback hex color string
-  `:file'     -- alternate `<file>.svg' stem in icon directory."
+  `:color' -- semantic palette token symbol or hex color string (used to tint
+              `currentColor' SVGs and fallback monograms; defaults to `fg-alt')
+  `:file'  -- alternate `<file>.svg' stem in the agent icon directory."
   :type '(alist :key-type string :value-type plist)
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme
+  :set #'herdr-sanctum--set-icon-option)
 
 ;;; Faces
 
-(defface herdr-sanctum-sidebar-brand
-  '((t :inherit variable-pitch :weight bold))
-  "Face for the top brand or title label in Sanctum sidebars."
-  :group 'herdr-sanctum)
+;; Semantic foreground faces stay purely declarative via `:inherit' so they
+;; track active themes across dark, light, and TTY frames automatically.
 
 (defface herdr-sanctum-sidebar-header
   '((t :inherit shadow :weight semi-bold))
-  "Face for section headers in Sanctum sidebars."
-  :group 'herdr-sanctum)
+  "Face for section headers in Sanctum sidebars and drawers."
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-group-working
   '((t :inherit warning :weight semi-bold))
   "Face for the `Working' agent group header."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-group-blocked
   '((t :inherit error :weight semi-bold))
   "Face for the `Blocked' agent group header."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-group-done
   '((t :inherit success :weight semi-bold))
   "Face for the `Done' agent group header."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-space
   '((t :inherit default :weight medium))
   "Face for space labels in `*sanctum-spaces*'."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-sidebar-space-active
-  '((t :inherit (bold hl-line) :extend t))
-  "Face for the focused space row in `*sanctum-spaces*'."
-  :group 'herdr-sanctum)
+(defface herdr-sanctum-sidebar-space-expanded
+  '((t :inherit default :weight semi-bold))
+  "Face for an expanded focused space row when a child tab holds focus."
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-tab
   '((t :inherit default))
   "Face for tab labels in the focused space."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-sidebar-tab-dim
-  '((t :inherit shadow))
-  "Face for inactive tab labels in non-focused spaces."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-sidebar-tab-ws-active
-  '((t :inherit font-lock-doc-face))
-  "Face for a non-focused space's active tab."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-sidebar-tab-active
-  '((t :inherit (bold hl-line) :extend t))
-  "Face for the globally focused tab or agent row."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-sidebar-guide
-  '((t :inherit shadow))
-  "Face for vertical tree guides and section dividers."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-sidebar-guide-active
-  '((t :inherit (font-lock-function-name-face bold)))
-  "Face for the active row's left accent bar."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-meta
   '((t :inherit shadow))
   "Face for right-aligned Git branches, counts, and durations."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-sidebar-tab-dim
+  '((t :inherit herdr-sanctum-sidebar-meta))
+  "Face for inactive tab labels in non-focused spaces."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-sidebar-tab-ws-active
+  '((t :inherit font-lock-doc-face))
+  "Face for a non-focused space's active tab."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-sidebar-tab-active
+  '((t :inherit herdr-sanctum-sidebar-space-active))
+  "Face for the globally focused tab or agent row."
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-git-behind
   '((t :inherit error :weight medium))
   "Face for behind-remote (`↓N') Git indicators."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-sidebar-git-ahead
   '((t :inherit font-lock-function-name-face :weight medium))
   "Face for ahead-of-remote (`↑N') Git indicators."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-chrome-bar
-  '((t :inherit header-line))
-  "Header-line bar face for `*sanctum*'."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-chrome-pill
-  '((t :inherit herdr-sanctum-chrome-bar))
-  "Clickable header-line button face for `*sanctum*'."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-chrome-pill-active
-  '((t :inherit herdr-sanctum-chrome-bar :weight semi-bold))
-  "Active header-line button pill face for `*sanctum*'."
-  :group 'herdr-sanctum)
-
-(defface herdr-sanctum-status-bar
-  '((t :inherit mode-line-inactive))
-  "Bottom status strip face for Sanctum sidebars and drawers."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 (defface herdr-sanctum-drawer-tab
-  '((t :inherit shadow :weight medium))
+  '((t :inherit herdr-sanctum-sidebar-meta :weight medium))
   "Inactive view tab face in `*sanctum-drawer*'."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-drawer-tab-active
-  '((t :inherit default :weight semi-bold))
+;; Palette-driven chrome and surface faces populated by `herdr-sanctum-apply-theme'.
+
+(defface herdr-sanctum-sidebar-space-active nil
+  "Face for the focused space row in `*sanctum-spaces*'."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-sidebar-guide nil
+  "Face for vertical tree guides and section dividers."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-chrome-bar nil
+  "Shared header-line bar face across Sanctum panes."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-chrome-pill nil
+  "Clickable header-line button face for Sanctum chrome bars."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-chrome-pill-active nil
+  "Active header-line button pill face for Sanctum chrome bars."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-chrome-sep nil
+  "Subtle separator face for dividing control groups in Sanctum header-lines."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-status-bar nil
+  "Bottom status strip face for Sanctum sidebars and drawers."
+  :group 'herdr-sanctum-theme)
+
+(defface herdr-sanctum-drawer-tab-active nil
   "Active view tab face in `*sanctum-drawer*'."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-drawer-card
-  '((t :inherit default :extend t))
+(defface herdr-sanctum-drawer-card nil
   "Elevated card background face in `*sanctum-drawer*'."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-drawer-button
-  '((t :inherit default :weight semi-bold))
+(defface herdr-sanctum-drawer-button nil
   "Compact action button pill face in `*sanctum-drawer*'."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-banner-info
-  '((t :inherit header-line :weight bold :extend t))
+(defface herdr-sanctum-banner-info nil
   "Header-line banner face for terminal read-only or info modes."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
-(defface herdr-sanctum-banner-warn
-  '((t :inherit warning :weight bold :extend t))
+(defface herdr-sanctum-banner-warn nil
   "Header-line banner face for raw character passthrough mode."
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-theme)
 
 ;;; Palette Derivation (Modus / Ef / Generic Light & Dark)
 
@@ -293,15 +304,12 @@ Each entry is `(NAME . PLIST)' where PLIST supports:
     (fg-alt         . fg-alt)
     (yellow         . yellow-warmer)
     (red            . red-intense)
-    (red-warmer     . red-warmer)
-    (green          . green)
-    (cyan           . cyan)
-    (magenta        . magenta-cooler))
+    (green          . green))
   "Mapping from Sanctum semantic tokens to Modus/Ef palette symbols.")
 
 (defconst herdr-sanctum--dark-fallback-palette
   '((bg-chrome      . "#161824")
-    (bg-card        . "#1b1e2e")
+    (bg-card        . "#1e2234")
     (bg-hl          . "#161a2b")
     (bg-selected    . "#24283b")
     (bg-pill-active . "#263047")
@@ -313,15 +321,12 @@ Each entry is `(NAME . PLIST)' where PLIST supports:
     (fg-alt         . "#a6b2d4")
     (yellow         . "#dbb47b")
     (red            . "#e67e90")
-    (red-warmer     . "#de8e80")
-    (green          . "#7ec495")
-    (cyan           . "#7dc2b8")
-    (magenta        . "#b4a4e6"))
+    (green          . "#7ec495"))
   "Default dark palette used when theme colors cannot be queried.")
 
 (defconst herdr-sanctum--light-fallback-palette
   '((bg-chrome      . "#eceff4")
-    (bg-card        . "#e5e9f0")
+    (bg-card        . "#e2e7f0")
     (bg-hl          . "#e2e6ef")
     (bg-selected    . "#d8dee9")
     (bg-pill-active . "#cfd8ea")
@@ -333,10 +338,7 @@ Each entry is `(NAME . PLIST)' where PLIST supports:
     (fg-alt         . "#4c566a")
     (yellow         . "#9a6700")
     (red            . "#c93b4b")
-    (red-warmer     . "#c05640")
-    (green          . "#2f7d4d")
-    (cyan           . "#267a78")
-    (magenta        . "#7b52ab"))
+    (green          . "#2f7d4d"))
   "Default light palette used when theme colors cannot be queried.")
 
 (defun herdr-sanctum--valid-color-p (color)
@@ -401,7 +403,7 @@ Each entry is `(NAME . PLIST)' where PLIST supports:
                      (alist-get 'accent fallback-tbl))))
     (or (pcase token
           ('bg-chrome      (herdr-sanctum--blend bg fg (if light-p 0.05 0.06)))
-          ('bg-card        (herdr-sanctum--blend bg fg (if light-p 0.08 0.09)))
+          ('bg-card        (herdr-sanctum--blend bg fg (if light-p 0.10 0.11)))
           ('bg-hl          (or (herdr-sanctum--face-color 'hl-line :background)
                                (herdr-sanctum--blend bg fg (if light-p 0.07 0.08))))
           ('bg-selected    (herdr-sanctum--blend bg fg (if light-p 0.13 0.15)))
@@ -415,30 +417,50 @@ Each entry is `(NAME . PLIST)' where PLIST supports:
           ('fg-alt         (herdr-sanctum--blend fg bg 0.20))
           ('yellow         (herdr-sanctum--face-color 'warning :foreground))
           ('red            (herdr-sanctum--face-color 'error :foreground))
-          ('red-warmer     (herdr-sanctum--face-color 'error :foreground))
-          ('green          (herdr-sanctum--face-color 'success :foreground))
-          ('cyan           (herdr-sanctum--face-color 'font-lock-type-face :foreground))
-          ('magenta        (herdr-sanctum--face-color 'font-lock-keyword-face :foreground)))
+          ('green          (herdr-sanctum--face-color 'success :foreground)))
         (alist-get token fallback-tbl))))
 
 (defun herdr-sanctum-default-palette-color (token &optional fallback)
   "Resolve semantic palette TOKEN using Modus, Ef, or generic face derivation.
 FALLBACK is returned if no color could be determined."
-  (let ((mapped (or (alist-get token herdr-sanctum--modus-token-map) token)))
-    (or (and (fboundp 'modus-themes-get-color-value)
-             (ignore-errors (modus-themes-get-color-value mapped t)))
-        (and (fboundp 'ef-themes-get-color-value)
-             (ignore-errors (ef-themes-get-color-value mapped t)))
-        (herdr-sanctum--derive-generic-color token)
-        fallback)))
+  (let* ((key (cons (herdr-sanctum--background-mode) token))
+         (cached (gethash key herdr-sanctum--palette-cache 'miss))
+         (safe-fallback (when (herdr-sanctum--valid-color-p fallback) fallback)))
+    (if (not (eq cached 'miss))
+        (or cached safe-fallback)
+      (let* ((mapped (or (alist-get token herdr-sanctum--modus-token-map) token))
+             (resolved
+              (or (let ((c (and (fboundp 'modus-themes-get-color-value)
+                                (ignore-errors (modus-themes-get-color-value mapped t)))))
+                    (when (herdr-sanctum--valid-color-p c) c))
+                  (let ((c (and (fboundp 'ef-themes-get-color-value)
+                                (ignore-errors (ef-themes-get-color-value mapped t)))))
+                    (when (herdr-sanctum--valid-color-p c) c))
+                  (let ((c (herdr-sanctum--derive-generic-color token)))
+                    (when (herdr-sanctum--valid-color-p c) c)))))
+        (puthash key resolved herdr-sanctum--palette-cache)
+        (or resolved safe-fallback)))))
 
 (defun herdr-sanctum-palette-color (token &optional fallback)
   "Resolve semantic color TOKEN via `herdr-sanctum-palette-function'."
-  (or (and (functionp herdr-sanctum-palette-function)
-           (funcall herdr-sanctum-palette-function token fallback))
-      (herdr-sanctum-default-palette-color token fallback)))
+  (let ((color (and (functionp herdr-sanctum-palette-function)
+                    (funcall herdr-sanctum-palette-function token fallback))))
+    (cond
+     ((herdr-sanctum--valid-color-p color) color)
+     ((eq herdr-sanctum-palette-function #'herdr-sanctum-default-palette-color)
+      (when (herdr-sanctum--valid-color-p fallback) fallback))
+     (t (herdr-sanctum-default-palette-color token fallback)))))
 
-;;; Font & Remapping
+;;; Frame & Font Helpers
+
+(defun herdr-sanctum--graphic-frame (&optional frame)
+  "Return graphical FRAME, selected frame if graphical, or first GUI frame."
+  (or (and frame (display-graphic-p frame) frame)
+      (and (display-graphic-p) (selected-frame))
+      (seq-find (lambda (cand)
+                  (and (display-graphic-p cand)
+                       (not (frame-parameter cand 'parent-frame))))
+                (frame-list))))
 
 (defun herdr-sanctum-ui-font-family (&optional frame)
   "Return the UI font family for graphical Sanctum chrome, or nil."
@@ -446,146 +468,130 @@ FALLBACK is returned if no color could be determined."
    ((eq herdr-sanctum-ui-font 'default) nil)
    ((stringp herdr-sanctum-ui-font) herdr-sanctum-ui-font)
    (t
-    (when-let* ((f (or (and frame (display-graphic-p frame) frame)
-                       (and (display-graphic-p) (selected-frame))
-                       (seq-find (lambda (cand)
-                                   (and (display-graphic-p cand)
-                                        (not (frame-parameter cand 'parent-frame))))
-                                 (frame-list))))
+    (when-let* ((f (herdr-sanctum--graphic-frame frame))
                 (vp (face-attribute 'variable-pitch :family f t)))
-      (cond
-       ((and (stringp vp)
-             (not (member vp '("unspecified" "Sans Serif")))
-             (not (string-empty-p vp)))
-        vp)
-       (herdr-sanctum-ui-font-candidates
-        (cl-find-if (lambda (cand) (member cand (font-family-list f)))
-                    herdr-sanctum-ui-font-candidates)))))))
+      (when (and (stringp vp)
+                 (not (member vp '("unspecified" "Sans Serif")))
+                 (not (string-empty-p vp)))
+        vp)))))
 
-(defun herdr-sanctum-ui-remapping (bg hl &optional var-family)
-  "Build buffer `face-remapping-alist' for Sanctum sidebars and drawers.
-BG is the chrome background color, HL is the `hl-line' background, and
-VAR-FAMILY overrides the UI font family when provided."
-  (let ((family (or var-family (herdr-sanctum-ui-font-family))))
-    `((default ,(append (when (and (stringp family) (not (equal family "unspecified")))
-                          (list :family family))
-                        (list :background bg
-                              :height herdr-sanctum-ui-font-height))
-               default)
-      (hl-line (:background ,hl :extend t) hl-line)
-      (mode-line (:inherit herdr-sanctum-status-bar) mode-line)
-      (mode-line-active (:inherit herdr-sanctum-status-bar) mode-line-active)
-      (mode-line-inactive (:inherit herdr-sanctum-status-bar) mode-line-inactive))))
+;;; Theme Application
 
-(defun herdr-sanctum-apply-theme (&rest _)
-  "Align Sanctum sidebar, header, status bar, and drawer faces with active theme."
-  (clrhash herdr-sanctum--svg-cache)
-  (let ((bg (herdr-sanctum-palette-color 'bg-chrome))
-        (card (herdr-sanctum-palette-color 'bg-card))
-        (hl (herdr-sanctum-palette-color 'bg-hl))
-        (sel (herdr-sanctum-palette-color 'bg-selected))
-        (pill-active (herdr-sanctum-palette-color 'bg-pill-active))
-        (border (herdr-sanctum-palette-color 'border))
-        (accent (herdr-sanctum-palette-color 'accent))
-        (fg-main (herdr-sanctum-palette-color 'fg-main))
-        (fg-dim (herdr-sanctum-palette-color 'fg-dim))
-        (fg-alt (herdr-sanctum-palette-color 'fg-alt))
-        (yellow (herdr-sanctum-palette-color 'yellow))
-        (red (herdr-sanctum-palette-color 'red))
-        (green (herdr-sanctum-palette-color 'green))
-        (guide (herdr-sanctum-palette-color 'guide))
-        (var-family (herdr-sanctum-ui-font-family)))
-    (face-spec-set 'herdr-sanctum-sidebar-brand `((t :foreground ,fg-main :weight bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-header `((t :foreground ,fg-dim :weight semi-bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-group-working `((t :foreground ,yellow :weight semi-bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-group-blocked `((t :foreground ,red :weight semi-bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-group-done `((t :foreground ,green :weight semi-bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-space `((t :foreground ,fg-alt :weight medium)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-space-active `((t :foreground ,fg-main :background ,sel :weight semi-bold :extend t)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-tab `((t :foreground ,fg-main)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-tab-dim `((t :foreground ,fg-dim)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-tab-ws-active `((t :foreground ,fg-alt)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-tab-active `((t :foreground ,fg-main :background ,sel :weight semi-bold :extend t)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-guide `((t :foreground ,guide)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-guide-active `((t :foreground ,accent :background ,sel :weight bold)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-meta `((t :foreground ,fg-dim)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-git-behind `((t :foreground ,red :weight medium)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-sidebar-git-ahead `((t :foreground ,accent :weight medium)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-chrome-bar
-                   `((t ,@(when (and (stringp var-family) (not (equal var-family "unspecified")))
-                            (list :family var-family))
-                        :height ,herdr-sanctum-ui-font-height
-                        :background ,bg :foreground ,fg-dim
-                        :underline (:color ,border :position t)))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-chrome-pill
-                   `((t :inherit herdr-sanctum-chrome-bar :foreground ,fg-alt :background ,bg))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-chrome-pill-active
-                   `((t :inherit herdr-sanctum-chrome-bar :foreground ,fg-main :background ,pill-active
-                        :weight semi-bold :box (:line-width (-1 . -1) :color ,accent)))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-status-bar
-                   `((t ,@(when (and (stringp var-family) (not (equal var-family "unspecified")))
-                            (list :family var-family))
-                        :height ,herdr-sanctum-ui-font-height
-                        :background ,bg :foreground ,fg-dim
-                        :overline ,border :box (:line-width (4 . 3) :color ,bg)))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-drawer-tab
-                   `((t :foreground ,fg-dim :weight medium)) 'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-drawer-tab-active
-                   `((t :foreground ,fg-main :weight semi-bold
-                        :underline (:color ,accent :position t)))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-drawer-card
-                   `((t :background ,card :foreground ,fg-main :extend t))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-drawer-button
-                   `((t :background ,sel :foreground ,fg-main :weight semi-bold
-                        :box (:line-width (-1 . -1) :color ,guide)))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-banner-info
-                   `((t :inherit herdr-sanctum-chrome-bar
-                        :background ,sel :foreground ,accent :weight bold :extend t))
-                   'face-defface-spec)
-    (face-spec-set 'herdr-sanctum-banner-warn
-                   `((t :inherit herdr-sanctum-chrome-bar
-                        :background ,card :foreground ,yellow :weight bold :extend t))
-                   'face-defface-spec)
-    (dolist (name (list herdr-sanctum-sidebar-buffer-name
-                        herdr-sanctum-drawer-buffer-name))
-      (when-let* ((buf (get-buffer name)))
-        (with-current-buffer buf
-          (setq-local face-remapping-alist
-                      (herdr-sanctum-ui-remapping bg hl var-family))))))
-  (run-hooks 'herdr-sanctum-theme-change-hook))
+(defun herdr-sanctum--theme-state ()
+  "Return a comparable snapshot of the active theme and UI chrome settings."
+  (list (copy-sequence custom-enabled-themes)
+        (herdr-sanctum--background-mode)
+        (herdr-sanctum--face-color 'default :background)
+        (herdr-sanctum--face-color 'default :foreground)
+        herdr-sanctum-ui-font
+        herdr-sanctum-ui-font-height
+        herdr-sanctum-palette-function
+        (herdr-sanctum-ui-font-family)))
+
+(defun herdr-sanctum--chrome-face-specs (pal family-attrs ui-height)
+  "Build surface and chrome `(FACE . ATTRS)' alist from palette PAL."
+  (let-alist pal
+    `((herdr-sanctum-sidebar-space-active
+       :foreground ,.fg-main :background ,.bg-selected :weight semi-bold :extend t)
+      (herdr-sanctum-sidebar-guide
+       :foreground ,.guide)
+      (herdr-sanctum-chrome-bar
+       ,@family-attrs :height ,ui-height
+       :background ,.bg-chrome :foreground ,.fg-dim
+       :weight normal :slant normal :inverse-video nil
+       :box nil :overline nil :underline (:color ,.border :position t))
+      (herdr-sanctum-chrome-pill
+       :inherit herdr-sanctum-chrome-bar :foreground ,.fg-alt :background ,.bg-chrome :box nil)
+      (herdr-sanctum-chrome-pill-active
+       :inherit herdr-sanctum-chrome-bar :foreground ,.fg-main :background ,.bg-pill-active
+       :weight semi-bold :underline nil :box (:line-width (-1 . -1) :color ,.accent))
+      (herdr-sanctum-chrome-sep
+       :inherit herdr-sanctum-chrome-bar :foreground ,.guide)
+      (herdr-sanctum-status-bar
+       ,@family-attrs :height ,ui-height
+       :background ,.bg-chrome :foreground ,.fg-dim
+       :weight normal :slant normal :inverse-video nil
+       :underline nil :overline ,.border :box (:line-width (-1 . 3) :color ,.bg-chrome))
+      (herdr-sanctum-drawer-tab-active
+       :foreground ,.fg-main :weight semi-bold :underline (:color ,.accent :position t))
+      (herdr-sanctum-drawer-card
+       :background ,.bg-card :foreground ,.fg-main :extend t)
+      (herdr-sanctum-drawer-button
+       :background ,.bg-selected :foreground ,.fg-main :weight semi-bold
+       :box (:line-width (-1 . -1) :color ,.guide))
+      (herdr-sanctum-banner-info
+       :inherit herdr-sanctum-chrome-bar :background ,.bg-selected
+       :foreground ,.accent :weight bold :extend t)
+      (herdr-sanctum-banner-warn
+       :inherit herdr-sanctum-chrome-bar :background ,.bg-card
+       :foreground ,.yellow :weight bold :extend t))))
+
+;;;###autoload
+(defun herdr-sanctum-apply-theme (&optional force)
+  "Align Sanctum chrome and surface faces with the active theme.
+Coalesces duplicate calls when theme and UI font state have not changed
+unless FORCE is non-nil (always non-nil when called interactively)."
+  (interactive (list t))
+  (let ((state (herdr-sanctum--theme-state)))
+    (when (or force (not (equal state herdr-sanctum--last-theme-state)))
+      (clrhash herdr-sanctum--svg-cache)
+      (clrhash herdr-sanctum--palette-cache)
+      (let* ((fallbacks (if (eq (herdr-sanctum--background-mode) 'light)
+                            herdr-sanctum--light-fallback-palette
+                          herdr-sanctum--dark-fallback-palette))
+             (pal (mapcar (lambda (entry)
+                            (cons (car entry)
+                                  (herdr-sanctum-palette-color (car entry)
+                                                               (cdr entry))))
+                          fallbacks))
+             (var-family (herdr-sanctum-ui-font-family))
+             (family-attrs (when (and (stringp var-family)
+                                      (not (equal var-family "unspecified")))
+                             (list :family var-family)))
+             (specs (herdr-sanctum--chrome-face-specs
+                     pal family-attrs herdr-sanctum-ui-font-height)))
+        (dolist (entry specs)
+          (face-spec-set (car entry) `((t ,@(cdr entry))) 'face-defface-spec)))
+      (setq herdr-sanctum--last-theme-state state)
+      (cl-incf herdr-sanctum-theme-revision)
+      (force-mode-line-update t)
+      (run-hooks 'herdr-sanctum-theme-change-hook))))
+
+(defun herdr-sanctum--on-theme-change (&rest _)
+  "Coalescing hook trampoline for theme enable, disable, and post-load hooks."
+  (herdr-sanctum-apply-theme))
 
 (defun herdr-sanctum--frame-theme (frame)
-  "Refresh Sanctum chrome faces after a graphical FRAME finishes setup."
-  (when (and (display-graphic-p frame)
-             (not (frame-parameter frame 'parent-frame)))
+  "Refresh Sanctum chrome faces after a top-level FRAME finishes setup."
+  (when (and (frame-live-p frame)
+             (not (frame-parameter frame 'parent-frame))
+             (not (eq (frame-parameter frame 'minibuffer) 'only))
+             (or (display-graphic-p frame)
+                 (not (herdr-sanctum--graphic-frame))))
     (with-selected-frame frame
       (herdr-sanctum-apply-theme))))
 
-(add-hook 'enable-theme-functions #'herdr-sanctum-apply-theme)
-(add-hook 'modus-themes-after-load-theme-hook #'herdr-sanctum-apply-theme)
-(add-hook 'ef-themes-post-load-hook #'herdr-sanctum-apply-theme)
+(add-hook 'enable-theme-functions #'herdr-sanctum--on-theme-change)
+(add-hook 'disable-theme-functions #'herdr-sanctum--on-theme-change)
+(add-hook 'modus-themes-after-load-theme-hook #'herdr-sanctum--on-theme-change)
+(add-hook 'ef-themes-post-load-hook #'herdr-sanctum--on-theme-change)
 (add-hook 'after-make-frame-functions #'herdr-sanctum--frame-theme)
 (herdr-sanctum-apply-theme)
 
-;;; SVG Badges & Icons
+;;; SVG & Unicode Badges
 
-(defun herdr-sanctum-svg-available-p ()
-  "Return non-nil when inline SVG images can be displayed on the selected frame."
-  (and (display-graphic-p)
+(defun herdr-sanctum-svg-available-p (&optional frame)
+  "Return non-nil when inline SVG images can be displayed on FRAME.
+FRAME defaults to the selected frame."
+  (and (display-graphic-p frame)
        (fboundp 'image-type-available-p)
        (image-type-available-p 'svg)
        (require 'svg nil t)))
 
-(defun herdr-sanctum-space-badge (label &optional key active-bg)
+(defun herdr-sanctum-space-badge (label &optional key active-bg size)
   "Return a propertized monogram badge for space LABEL (hashed by KEY).
-When ACTIVE-BG is non-nil, apply it to the badge face background."
+When ACTIVE-BG is non-nil, apply it to the badge face background.
+Optional SIZE specifies the SVG width and height in pixels (default 15)."
   (if (eq herdr-sanctum-space-badge-style 'none)
       ""
     (let* ((trimmed (string-trim (or label "")))
@@ -597,23 +603,25 @@ When ACTIVE-BG is non-nil, apply it to the badge face background."
            (fg (cdr pair)))
       (if (and (eq herdr-sanctum-space-badge-style 'svg)
                (herdr-sanctum-svg-available-p))
-          (let* ((cache-key (list 'space letter bg fg))
+          (let* ((sz (or size 15))
+                 (rx (if (<= sz 13) 3 3.5))
+                 (cache-key (list 'space letter bg fg sz))
                  (img (or (gethash cache-key herdr-sanctum--svg-cache)
-                          (let ((svg (svg-create 17 17)))
-                            (svg-rectangle svg 0 0 17 17 :rx 4 :ry 4 :fill bg)
+                          (let ((svg (svg-create sz sz)))
+                            (svg-rectangle svg 0 0 sz sz :rx rx :ry rx :fill bg)
                             (svg-text svg letter
-                                      :x 8.5 :y 12.2
+                                      :x (/ sz 2.0) :y (* sz 0.72)
                                       :text-anchor "middle"
                                       :font-family "sans-serif"
-                                      :font-size 11
+                                      :font-size (max 8 (round (* sz 0.66)))
                                       :font-weight "700"
                                       :fill fg)
                             (let ((created (svg-image svg :ascent 'center)))
                               (puthash cache-key created herdr-sanctum--svg-cache)
                               created)))))
-            (propertize " "
-                        'display img
-                        'face (if active-bg `(:background ,active-bg) 'default)))
+            (if active-bg
+                (propertize " " 'display img 'face `(:background ,active-bg))
+              (propertize " " 'display img)))
         (propertize (format " %s " letter)
                     'face `(:background ,bg :foreground ,fg :weight bold))))))
 
@@ -621,31 +629,48 @@ When ACTIVE-BG is non-nil, apply it to the badge face background."
   "Return muted brand color hex for canonical AGENT name."
   (let* ((canon (downcase (or agent "")))
          (spec (cdr (assoc canon herdr-sanctum-agent-brands)))
-         (color-spec (plist-get spec :color))
-         (fallback (or (plist-get spec :fallback)
-                       (herdr-sanctum-palette-color 'fg-alt "#a6b2d4"))))
+         (color-spec (plist-get spec :color)))
     (cond
-     ((stringp color-spec) color-spec)
-     ((symbolp color-spec) (herdr-sanctum-palette-color color-spec fallback))
+     ((herdr-sanctum--valid-color-p color-spec) color-spec)
+     ((symbolp color-spec)
+      (herdr-sanctum-palette-color (or color-spec 'fg-alt) "#a6b2d4"))
      (t (herdr-sanctum-palette-color 'fg-alt "#a6b2d4")))))
 
 (defun herdr-sanctum--agent-svg-file-raw (canon)
-  "Read and cache raw SVG text for agent CANON from the icon directory."
+  "Read and cache raw SVG text for agent CANON from the icon directory.
+Strips leading XML declarations, DOCTYPE declarations, and comments so the
+root `<svg>' element can be safely embedded inside an outer `<g>'."
   (when (and herdr-sanctum-agent-icon-directory
              (not (string-empty-p canon)))
     (let* ((spec (cdr (assoc canon herdr-sanctum-agent-brands)))
-           (name (or (plist-get spec :file) canon))
-           (path (expand-file-name (concat name ".svg")
-                                   herdr-sanctum-agent-icon-directory))
-           (cached (gethash path herdr-sanctum--svg-file-cache 'miss)))
-      (if (not (eq cached 'miss))
-          cached
-        (let ((raw (when (file-readable-p path)
-                     (with-temp-buffer
-                       (insert-file-contents path)
-                       (buffer-string)))))
-          (puthash path raw herdr-sanctum--svg-file-cache)
-          raw)))))
+           (name (or (plist-get spec :file) canon)))
+      (when (and (stringp name)
+                 (not (member name '("." "..")))
+                 (string-match-p "\\`[a-z0-9._-]+\\'" name))
+        (let* ((path (expand-file-name (concat name ".svg")
+                                       herdr-sanctum-agent-icon-directory))
+               (cached (gethash path herdr-sanctum--svg-file-cache 'miss)))
+          (if (not (eq cached 'miss))
+              cached
+            (let ((raw (when (file-readable-p path)
+                         (with-temp-buffer
+                           (insert-file-contents path)
+                           (goto-char (point-min))
+                           (when (eq (char-after) ?\ufeff)
+                             (forward-char 1))
+                           (let ((case-fold-search nil))
+                             (while (or (progn (skip-chars-forward " \t\r\n") nil)
+                                        (looking-at "<\\?\\(?:.\\|\n\\)*?\\?>")
+                                        (looking-at "<!--\\(?:.\\|\n\\)*?-->")
+                                        (looking-at "<!DOCTYPE\\(?:[^[>]\\|\\[\\(?:.\\|\n\\)*?\\]\\)*>"))
+                               (goto-char (match-end 0))))
+                           (let ((body (string-trim
+                                        (buffer-substring-no-properties
+                                         (point) (point-max)))))
+                             (unless (string-empty-p body)
+                               body))))))
+              (puthash path raw herdr-sanctum--svg-file-cache)
+              raw)))))))
 
 (defun herdr-sanctum--agent-svg-file-image (canon color opacity dot-color cutout-bg active-bg)
   "Compose a 14x14 SVG image from `<agent>.svg' for CANON with status overlay."
@@ -665,20 +690,33 @@ When ACTIVE-BG is non-nil, apply it to the badge face background."
                       bg-rect opacity sized dot)))
       (create-image composed 'svg t :ascent 'center))))
 
-;;;###autoload
-(defun herdr-sanctum-toggle-agent-icon-style ()
-  "Toggle coding-agent icons between `svg-files' and `builtin' styles."
-  (interactive)
-  (let ((next (if (eq herdr-sanctum-agent-icon-style 'svg-files) 'builtin 'svg-files)))
-    (setq herdr-sanctum-agent-icon-style next)
-    (clrhash herdr-sanctum--svg-cache)
-    (run-hooks 'herdr-sanctum-theme-change-hook)
-    (message "Sanctum agent icon style: %s" next)))
+(defun herdr-sanctum--agent-monogram-image (canon color opacity dot-color cutout-bg active-bg)
+  "Build a 14x14 fallback 1-letter SVG monogram image for agent CANON."
+  (let ((svg (svg-create 14 14))
+        (letter (upcase (if (string-empty-p canon) "A" (substring canon 0 1)))))
+    (when active-bg
+      (svg-rectangle svg 0 0 14 14 :fill active-bg))
+    (svg-rectangle svg 1.0 1.0 12.0 12.0 :rx 3.5 :ry 3.5
+                   :fill color :fill-opacity (* 0.20 opacity)
+                   :stroke color :stroke-width 0.9
+                   :stroke-opacity (* 0.65 opacity))
+    (svg-text svg letter
+              :x 7.0 :y 10.1
+              :text-anchor "middle"
+              :font-family "sans-serif"
+              :font-size 9
+              :font-weight "700"
+              :fill color :fill-opacity opacity)
+    (when dot-color
+      (svg-circle svg 11.4 11.4 2.4
+                  :fill dot-color :stroke cutout-bg :stroke-width 1.2))
+    (svg-image svg :ascent 'center)))
 
 (defun herdr-sanctum-agent-badge (agent status &optional active-bg)
   "Return a propertized 14x14 brand icon for AGENT with STATUS overlay."
   (let* ((canon (downcase (string-trim (or agent ""))))
-         (fallback (pcase status
+         (st (or status "idle"))
+         (fallback (pcase st
                      ("blocked" (cons "◆" 'warning))
                      ("done"    (cons "✓" 'success))
                      ("working" (cons "●" 'font-lock-function-name-face))
@@ -686,92 +724,24 @@ When ACTIVE-BG is non-nil, apply it to the badge face background."
          (glyph (car fallback))
          (base-face (cdr fallback))
          (face (if active-bg (list base-face `(:background ,active-bg)) base-face)))
-    (if (and (not (eq herdr-sanctum-agent-icon-style 'unicode))
+    (if (and (eq herdr-sanctum-agent-icon-style 'svg-files)
              (herdr-sanctum-svg-available-p))
         (let* ((color (herdr-sanctum--agent-brand-color canon))
-               (opacity (if (equal status "idle") 0.58 1.0))
-               (dot-color (pcase status
+               (opacity (if (equal st "idle") 0.58 1.0))
+               (dot-color (pcase st
                             ("blocked" (herdr-sanctum-palette-color 'red))
                             ("done"    (herdr-sanctum-palette-color 'green))))
                (cutout-bg (or active-bg (herdr-sanctum-palette-color 'bg-chrome)))
-               (style herdr-sanctum-agent-icon-style)
-               (cache-key (list 'agent-brand style canon (or status "idle") color active-bg))
+               (cache-key (list 'agent-brand canon st color dot-color cutout-bg
+                                active-bg herdr-sanctum-agent-icon-directory))
                (img (or (gethash cache-key herdr-sanctum--svg-cache)
-                        (when-let* ((file-img
-                                     (and (eq style 'svg-files)
-                                          (herdr-sanctum--agent-svg-file-image
-                                           canon color opacity dot-color cutout-bg active-bg))))
-                          (puthash cache-key file-img herdr-sanctum--svg-cache)
-                          file-img)
-                        (let ((svg (svg-create 14 14)))
-                          (when active-bg
-                            (svg-rectangle svg 0 0 14 14 :fill active-bg))
-                          (pcase canon
-                            ("pi"
-                             (svg-line svg 2.0 3.5 12.0 3.5
-                                       :stroke color :stroke-width 1.8
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-line svg 4.7 3.8 4.7 11.2
-                                       :stroke color :stroke-width 1.7
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-polyline svg '((9.2 . 3.8) (9.2 . 10.6) (10.6 . 11.3))
-                                           :fill "none" :stroke color :stroke-width 1.7
-                                           :stroke-linecap "round" :stroke-linejoin "round"
-                                           :stroke-opacity opacity))
-                            ((or "claude" "claude-code")
-                             (svg-line svg 7.0 2.0 7.0 12.0
-                                       :stroke color :stroke-width 1.55
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-line svg 2.0 7.0 12.0 7.0
-                                       :stroke color :stroke-width 1.55
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-line svg 3.6 3.6 10.4 10.4
-                                       :stroke color :stroke-width 1.45
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-line svg 10.4 3.6 3.6 10.4
-                                       :stroke color :stroke-width 1.45
-                                       :stroke-linecap "round" :stroke-opacity opacity)
-                             (svg-circle svg 7.0 7.0 1.3 :fill color :fill-opacity opacity))
-                            ("codex"
-                             (svg-rectangle svg 1.0 1.5 12.0 11.0 :rx 3 :ry 3
-                                            :fill color :fill-opacity (* 0.14 opacity)
-                                            :stroke color :stroke-width 1.1
-                                            :stroke-opacity (* 0.78 opacity))
-                             (svg-polyline svg '((3.6 . 4.7) (6.2 . 7.0) (3.6 . 9.3))
-                                           :fill "none" :stroke color :stroke-width 1.5
-                                           :stroke-linecap "round" :stroke-linejoin "round"
-                                           :stroke-opacity opacity)
-                             (svg-line svg 7.4 9.3 10.4 9.3
-                                       :stroke color :stroke-width 1.5
-                                       :stroke-linecap "round" :stroke-opacity opacity))
-                            ("gemini"
-                             (svg-polygon svg '((7.0 . 1.2) (8.6 . 5.4) (12.8 . 7.0)
-                                                (8.6 . 8.6) (7.0 . 12.8) (5.4 . 8.6)
-                                                (1.2 . 7.0) (5.4 . 5.4))
-                                          :fill color :fill-opacity opacity))
-                            (_
-                             (let ((letter (upcase (if (string-empty-p canon)
-                                                       "A"
-                                                     (substring canon 0 1)))))
-                               (svg-rectangle svg 1.0 1.0 12.0 12.0 :rx 3.5 :ry 3.5
-                                              :fill color :fill-opacity (* 0.20 opacity)
-                                              :stroke color :stroke-width 0.9
-                                              :stroke-opacity (* 0.65 opacity))
-                               (svg-text svg letter
-                                         :x 7.0 :y 10.1
-                                         :text-anchor "middle"
-                                         :font-family "sans-serif"
-                                         :font-size 9
-                                         :font-weight "700"
-                                         :fill color :fill-opacity opacity))))
-                          (when dot-color
-                            (svg-circle svg 11.4 11.4 2.4
-                                        :fill dot-color
-                                        :stroke cutout-bg
-                                        :stroke-width 1.2))
-                          (let ((created (svg-image svg :ascent 'center)))
-                            (puthash cache-key created herdr-sanctum--svg-cache)
-                            created)))))
+                        (let ((created
+                               (or (herdr-sanctum--agent-svg-file-image
+                                    canon color opacity dot-color cutout-bg active-bg)
+                                   (herdr-sanctum--agent-monogram-image
+                                    canon color opacity dot-color cutout-bg active-bg))))
+                          (puthash cache-key created herdr-sanctum--svg-cache)
+                          created))))
           (propertize glyph 'display img 'face face))
       (propertize glyph 'face face))))
 
@@ -799,17 +769,19 @@ and ACTIVE is nil, render a subtle tree guide; otherwise return an 8px spacer."
                         'display img
                         'face (cond
                                (active-bg `(:background ,active-bg))
-                               (active 'herdr-sanctum-sidebar-guide-active)
+                               (active `(:foreground ,color :weight bold))
                                (t 'herdr-sanctum-sidebar-guide))))
-        (propertize " "
-                    'display '(space :width (8))
-                    'face (if active-bg `(:background ,active-bg) 'default)))
+        (if active-bg
+            (propertize " " 'display '(space :width (8)) 'face `(:background ,active-bg))
+          (propertize " " 'display '(space :width (8)))))
     (cond
-     (active (propertize "▎" 'face 'herdr-sanctum-sidebar-guide-active))
+     (active (propertize "▎" 'face
+                         `(:foreground ,(herdr-sanctum-palette-color 'accent)
+                           :background ,(or active-bg
+                                            (herdr-sanctum-palette-color 'bg-selected))
+                           :weight bold)))
      (guide  (propertize "│" 'face 'herdr-sanctum-sidebar-guide))
      (t      " "))))
-
-;;; Shared Layout & Formatting Helpers
 
 (defun herdr-sanctum-status-glyph (status &optional active-bg)
   "Return a propertized single-column glyph for agent STATUS, or nil."
@@ -824,95 +796,6 @@ and ACTIVE is nil, render a subtle tree guide; otherwise return an 8px spacer."
                   'face (if active-bg
                             (list base-face `(:background ,active-bg))
                           base-face)))))
-
-(defun herdr-sanctum-truncate (text max-width &optional bg-face)
-  "Truncate TEXT to MAX-WIDTH display columns using an ellipsis."
-  (if (<= max-width 0)
-      ""
-    (let ((ellipsis (if bg-face (propertize "…" 'face bg-face) "…")))
-      (truncate-string-to-width text max-width nil nil ellipsis))))
-
-(defun herdr-sanctum-truncate-px (text max-px &optional bg-face)
-  "Truncate propertized TEXT to fit within MAX-PX pixels on graphical frames."
-  (let ((buf (current-buffer)))
-    (if (or (<= max-px 0) (<= (string-pixel-width text buf) max-px))
-        text
-      (let* ((ellipsis (if bg-face (propertize "…" 'face bg-face) "…"))
-             (ell-px (string-pixel-width ellipsis buf))
-             (limit (max 8 (- max-px ell-px)))
-             (lo 0)
-             (hi (length text)))
-        (while (< lo hi)
-          (let ((mid (/ (+ lo hi 1) 2)))
-            (if (<= (string-pixel-width (substring text 0 mid) buf) limit)
-                (setq lo mid)
-              (setq hi (1- mid)))))
-        (concat (substring text 0 lo) ellipsis)))))
-
-(defun herdr-sanctum--pad-row (left right width &optional bg-face)
-  "Align LEFT and RIGHT within WIDTH columns, optionally filling with BG-FACE."
-  (let* ((rw (string-width right))
-         (max-left (max 1 (- width (if (> rw 0) (1+ rw) 0))))
-         (trimmed (if (> (string-width left) max-left)
-                      (herdr-sanctum-truncate left max-left bg-face)
-                    left))
-         (gap (max (if (> rw 0) 1 0) (- width (string-width trimmed) rw)))
-         (pad (if bg-face
-                  (propertize (make-string gap ?\s) 'face bg-face)
-                (make-string gap ?\s))))
-    (concat trimmed pad right)))
-
-(defun herdr-sanctum-format-row (left right width win &optional bg-face)
-  "Align LEFT and RIGHT for WIN (pixel-exact on GUI, column-aligned on TTY)."
-  (if (and (display-graphic-p)
-           (window-live-p win)
-           (fboundp 'string-pixel-width))
-      (let* ((buf (current-buffer))
-             ;; With zero fringes and `truncate-lines', Emacs reserves one
-             ;; rightmost cell for the truncation slot even when it is blank.
-             (usable-px (max 80 (- (window-body-width win t)
-                                   (frame-char-width (window-frame win))
-                                   2)))
-             (right-px (if (string-empty-p right) 0 (string-pixel-width right buf)))
-             (gap-px (if (> right-px 0) 10 0))
-             (align-px (max 0 (- usable-px right-px)))
-             (trimmed (herdr-sanctum-truncate-px
-                       left (- align-px gap-px) bg-face)))
-        (if (string-empty-p right)
-            trimmed
-          (concat trimmed
-                  (propertize " "
-                              'display `(space :align-to (,align-px))
-                              'face (or bg-face 'default))
-                  right)))
-    (herdr-sanctum--pad-row left right width bg-face)))
-
-(defun herdr-sanctum-divider-line (width &optional win)
-  "Return a subtle full-width horizontal hairline divider string."
-  (if (and (display-graphic-p) (window-live-p win))
-      (let ((px (max 40 (- (window-body-width win t)
-                           (frame-char-width (window-frame win))
-                           2)))
-            (color (herdr-sanctum-palette-color 'border)))
-        (propertize " "
-                    'display `(space :align-to (,px))
-                    'face `(:underline (:color ,color :position t))))
-    (propertize (make-string (max 8 width) ?─) 'face 'herdr-sanctum-sidebar-guide)))
-
-(defun herdr-sanctum-make-chrome-button (label fn face help &optional area)
-  "Create a clickable chrome button LABEL running FN in AREA.
-AREA is `header-line' (default) or `mode-line'; FACE and HELP style it."
-  (let ((map (make-sparse-keymap))
-        (key (vector (or area 'header-line) 'mouse-1)))
-    (define-key map key
-                (lambda ()
-                  (interactive)
-                  (funcall fn)))
-    (propertize label
-                'face face
-                'mouse-face 'mode-line-highlight
-                'local-map map
-                'help-echo help)))
 
 (provide 'herdr-sanctum-theme)
 ;;; herdr-sanctum-theme.el ends here

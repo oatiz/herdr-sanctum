@@ -4,7 +4,7 @@
 
 ;; Author: oatiz <iamoatiz@gmail.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; URL: https://github.com/oatiz/herdr-sanctum
 ;; Keywords: tools, terminals, processes
 
@@ -28,7 +28,7 @@
 ;;
 ;;  - Persistent Spaces & Agents sidebar (`*sanctum-spaces*') with inline SVG
 ;;    monograms, async Git branch/status, on-demand tab expansion, and
-;;    bottom-anchored agents grouped by Blocked / Working / Done / Idle.
+;;    compact agents grouped by Blocked / Working / Done / Idle.
 ;;  - Dedicated center terminal (`*sanctum*') hosted through a pluggable
 ;;    terminal backend (shipping with `ghostel') and topped with a quiet
 ;;    breadcrumb + action chrome header-line.
@@ -53,6 +53,7 @@
 (require 'herdr-sanctum-rpc)
 (require 'herdr-sanctum-git)
 (require 'herdr-sanctum-theme)
+(require 'herdr-sanctum-ui)
 (require 'herdr-sanctum-terminal)
 (require 'herdr-sanctum-sidebar)
 (require 'herdr-sanctum-drawer)
@@ -100,14 +101,6 @@ the active frame."
   :type 'boolean
   :group 'herdr-sanctum)
 
-(defcustom herdr-sanctum-terminal-font-height nil
-  "Optional `:height' remapping applied to `*sanctum*' terminal body text.
-When nil, keep the active terminal mode's default height."
-  :type '(choice (const :tag "Default" nil)
-                 (integer :tag "Absolute 1/10pt")
-                 (float :tag "Relative scale"))
-  :group 'herdr-sanctum)
-
 (defcustom herdr-sanctum-maximize-window-function #'herdr-sanctum-default-maximize-window
   "Fallback function called by `herdr-sanctum-zoom-or-maximize' outside Herdr
 or when Herdr has only a single pane."
@@ -121,14 +114,14 @@ or when Herdr has only a single pane."
                  (function :tag "Fallback command"))
   :group 'herdr-sanctum)
 
-(defvar herdr-sanctum--status-counts nil
-  "Cached `(BLOCKED . DONE)' counts for the global attention badge.")
-
 (defvar herdr-sanctum--mode-line-string nil
   "Cached global status badge for Herdr agents needing attention.")
 
-(defvar herdr-sanctum--saved-window-config nil
-  "Saved window configuration for `herdr-sanctum-default-maximize-window'.")
+(defvar-local herdr-sanctum--header-line-string nil
+  "Pre-formatted top chrome `header-line-format' string for `*sanctum*'.")
+
+(defvar-local herdr-sanctum--header-line-dirty nil
+  "Non-nil when `*sanctum*' header-line needs refresh on next display.")
 
 ;;; Global Attention Badge
 
@@ -166,30 +159,24 @@ or when Herdr has only a single pane."
 (defun herdr-sanctum-mode-line ()
   "Return the global agent attention badge when appropriate."
   (when (and herdr-sanctum-status-badge-enable
-             herdr-sanctum--mode-line-string
-             (not (and (member (buffer-name (window-buffer))
-                               (herdr-sanctum-ui-buffers))
-                       (herdr-sanctum-sidebar-visible-p))))
-    herdr-sanctum--mode-line-string))
+             herdr-sanctum--mode-line-string)
+    (unless (herdr-sanctum-sidebar-visible-p (window-frame))
+      herdr-sanctum--mode-line-string)))
 
 (defun herdr-sanctum--update-badge-from-snapshot (snapshot)
-  "Recompute global attention badge counts from SNAPSHOT."
+  "Recompute global attention badge string from SNAPSHOT."
   (let ((blocked 0)
         (done 0))
     (dolist (agent (alist-get 'agents snapshot))
       (pcase (alist-get 'agent_status agent)
         ("blocked" (cl-incf blocked))
         ("done" (cl-incf done))))
-    (let ((counts (cons blocked done)))
-      (unless (equal counts herdr-sanctum--status-counts)
-        (setq herdr-sanctum--status-counts counts
-              herdr-sanctum--mode-line-string
-              (herdr-sanctum--format-status-badge blocked done))))))
+    (setq herdr-sanctum--mode-line-string
+          (herdr-sanctum--format-status-badge blocked done))))
 
 (defun herdr-sanctum--clear-badge ()
   "Clear cached global status badge on disconnect."
-  (setq herdr-sanctum--status-counts nil
-        herdr-sanctum--mode-line-string nil))
+  (setq herdr-sanctum--mode-line-string nil))
 
 (add-to-list 'global-mode-string '(:eval (herdr-sanctum-mode-line)) t)
 (add-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum--update-badge-from-snapshot)
@@ -197,23 +184,25 @@ or when Herdr has only a single pane."
 
 ;;; Top Header Line (*sanctum*)
 
-(defun herdr-sanctum-header-line-left ()
-  "Format the left breadcrumb segment of `*sanctum*' top chrome bar."
-  (let* ((snap (herdr-sanctum-snapshot))
+(defun herdr-sanctum-header-line-left (&optional snap ws dir)
+  "Format the left breadcrumb segment of `*sanctum*' top chrome bar.
+Optional SNAP, WS, and DIR supply pre-resolved snapshot values."
+  (let* ((snap (or snap (herdr-sanctum-snapshot)))
          (focused-ws-id (alist-get 'focused_workspace_id snap))
          (focused-tab-id (alist-get 'focused_tab_id snap))
-         (ws (and focused-ws-id
-                  (seq-find (lambda (w) (equal (alist-get 'workspace_id w) focused-ws-id))
-                            (alist-get 'workspaces snap))))
+         (ws (or ws
+                 (and focused-ws-id
+                      (seq-find (lambda (w) (equal (alist-get 'workspace_id w) focused-ws-id))
+                                (alist-get 'workspaces snap)))))
          (tab (and focused-tab-id
                    (seq-find (lambda (tb) (equal (alist-get 'tab_id tb) focused-tab-id))
                              (alist-get 'tabs snap))))
          (ws-label (or (alist-get 'label ws) "Sanctum"))
          (tab-label (alist-get 'label tab))
-         (dir (herdr-sanctum-focused-dir snap))
+         (dir (or dir (herdr-sanctum-focused-dir snap)))
          (short-dir (when dir (directory-file-name (abbreviate-file-name dir)))))
     (concat
-     " "
+     (propertize " " 'face 'herdr-sanctum-chrome-bar)
      (propertize ws-label 'face '(:inherit herdr-sanctum-chrome-bar :weight semi-bold))
      (if (and tab-label (not (equal tab-label ws-label)))
          (concat (propertize " / " 'face 'herdr-sanctum-chrome-bar)
@@ -223,69 +212,157 @@ or when Herdr has only a single pane."
          (propertize (concat "   " short-dir) 'face 'herdr-sanctum-chrome-bar)
        ""))))
 
-(defun herdr-sanctum-header-line-right ()
-  "Format the right action buttons of `*sanctum*' top chrome bar."
-  (let* ((snap (herdr-sanctum-snapshot))
-         (focused-ws-id (alist-get 'focused_workspace_id snap))
-         (dir (herdr-sanctum-focused-dir snap))
-         (git (and dir (herdr-sanctum-git-info-for-dir dir)))
-         (ctx (list :snapshot snap :dir dir :git git))
-         (drawer-open (herdr-sanctum-drawer-visible-p))
-         (cur-tab (herdr-sanctum-drawer-current-tab))
+(defun herdr-sanctum--create-focused-tab ()
+  "Create a new Herdr tab in the currently focused workspace."
+  (interactive)
+  (let ((focused-ws-id (alist-get 'focused_workspace_id (herdr-sanctum-snapshot))))
+    (herdr-sanctum-rpc-call
+     "tab.create"
+     (append `((focus . t))
+             (when focused-ws-id
+               `((workspace_id . ,focused-ws-id)))))))
+
+(defun herdr-sanctum-header-line-right (&optional ctx drawer-open)
+  "Format the right action buttons of `*sanctum*' top chrome bar.
+Optional CTX supplies a pre-resolved drawer badge context plist, and
+DRAWER-OPEN supplies pre-resolved drawer visibility when CTX is non-nil."
+  (let* ((win (or (plist-get ctx :win)
+                  (herdr-sanctum-panel-window)))
+         (frame (and (window-live-p win) (window-frame win)))
+         (drawer-open (if ctx
+                          drawer-open
+                        (herdr-sanctum-drawer-visible-p frame)))
          (btn-new (herdr-sanctum-make-chrome-button
                    " + "
-                   (lambda ()
-                     (herdr-sanctum-rpc-call
-                      "tab.create"
-                      (append `((focus . t))
-                              (when focused-ws-id
-                                `((workspace_id . ,focused-ws-id))))))
+                   'header-line
+                   #'herdr-sanctum--create-focused-tab
                    'herdr-sanctum-chrome-pill
                    "New tab in focused space"))
-         (view-btns
-          (mapcar (lambda (entry)
-                    (let* ((id (car entry))
-                           (spec (cdr entry))
-                           (label (plist-get spec :label))
-                           (badge-fn (plist-get spec :badge-fn))
-                           (badge (and (functionp badge-fn) (funcall badge-fn ctx)))
-                           (text (if (and (stringp badge) (not (string-empty-p badge)))
-                                     (format " %s %s " label badge)
-                                   (format " %s " label)))
-                           (face (if (and drawer-open (eq cur-tab id))
-                                     'herdr-sanctum-chrome-pill-active
-                                   'herdr-sanctum-chrome-pill)))
-                      (herdr-sanctum-make-chrome-button
-                       text
-                       (lambda () (herdr-sanctum-drawer-open-view id))
-                       face
-                       (or (plist-get spec :help)
-                           (format "Toggle %s drawer" label)))))
-                  (reverse (herdr-sanctum-drawer-active-views)))))
-    (concat (string-join (cons btn-new view-btns) " ") " ")))
+         (sep (propertize " │ " 'face 'herdr-sanctum-chrome-sep))
+         (sp (propertize " " 'face 'herdr-sanctum-chrome-bar))
+         (drawer-controls
+          (if drawer-open
+              (herdr-sanctum-make-chrome-button
+               " Hide "
+               'header-line
+               #'herdr-sanctum-drawer-toggle
+               'herdr-sanctum-chrome-pill-active
+               "Hide context drawer (C-c D)")
+            (let* ((badge-ctx
+                    (or ctx
+                        (let ((width (if (window-live-p win) (window-body-width win) 80)))
+                          (herdr-sanctum-drawer-build-context
+                           width win (herdr-sanctum-snapshot)))))
+                   (view-btns
+                    (mapcar (lambda (entry)
+                              (let* ((id (car entry))
+                                     (spec (cdr entry))
+                                     (label (plist-get spec :label))
+                                     (badge-fn (plist-get spec :badge-fn))
+                                     (badge (and (functionp badge-fn)
+                                                 (funcall badge-fn badge-ctx)))
+                                     (text (if (and (stringp badge)
+                                                    (not (string-empty-p badge)))
+                                               (format " %s %s " label badge)
+                                             (format " %s " label))))
+                                (herdr-sanctum-make-chrome-button
+                                 text
+                                 'header-line
+                                 (lambda () (herdr-sanctum-drawer-open-view id))
+                                 'herdr-sanctum-chrome-pill
+                                 (or (plist-get spec :help)
+                                     (format "Toggle %s drawer" label))
+                                 (cons 'header-drawer-view id))))
+                            (herdr-sanctum-drawer-active-views))))
+              (string-join view-btns sp)))))
+    (if (string-empty-p drawer-controls)
+        (concat btn-new sp)
+      (concat btn-new sep drawer-controls sp))))
+
+(defun herdr-sanctum--refresh-header-line (&optional win)
+  "Pre-format and cache `*sanctum*' top chrome header-line string.
+Optional WIN specifies the live window displaying `*sanctum*'."
+  (let ((buf (or (get-buffer herdr-sanctum-buffer-name) (current-buffer))))
+    (with-current-buffer buf
+      (let* ((snap (herdr-sanctum-snapshot))
+             (win (or (and (window-live-p win)
+                           (eq (window-buffer win) buf)
+                           win)
+                      (herdr-sanctum-panel-window buf)))
+             (frame (and (window-live-p win) (window-frame win)))
+             (drawer-open (and (herdr-sanctum-drawer-visible-p frame) t))
+             (focused-ws-id (alist-get 'focused_workspace_id snap))
+             (ws (and focused-ws-id
+                      (seq-find (lambda (w) (equal (alist-get 'workspace_id w) focused-ws-id))
+                                (alist-get 'workspaces snap))))
+             (dir (herdr-sanctum-focused-dir snap))
+             (git (and (not drawer-open) dir (herdr-sanctum-git-info-for-dir dir)))
+             (width (if (window-live-p win) (window-body-width win) 80))
+             (ctx (list :width width
+                        :win win
+                        :snapshot snap
+                        :workspace ws
+                        :dir dir
+                        :git git))
+             (formatted (herdr-sanctum-format-header-line
+                         (herdr-sanctum-header-line-left snap ws dir)
+                         (herdr-sanctum-header-line-right ctx drawer-open)
+                         win)))
+        (when (window-live-p win)
+          (set-window-parameter
+           win 'herdr-sanctum-header-width
+           (window-body-width win (display-graphic-p (window-frame win)))))
+        (setq herdr-sanctum--header-line-string formatted
+              herdr-sanctum--header-line-dirty nil)
+        (force-mode-line-update)
+        formatted))))
+
+(defun herdr-sanctum--sync-header-line (&rest _)
+  "Refresh `*sanctum*' header-line when visible, or mark it dirty."
+  (when herdr-sanctum-header-line-enable
+    (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
+      (if-let* ((win (herdr-sanctum-panel-window buf)))
+          (herdr-sanctum--refresh-header-line win)
+        (with-current-buffer buf
+          (setq herdr-sanctum--header-line-dirty t))))))
+
+(defun herdr-sanctum--on-git-header-line (dir _info)
+  "Refresh `*sanctum*' header-line when focused DIR's Git metadata updates."
+  (when (or (null dir) (equal dir (herdr-sanctum-focused-dir)))
+    (herdr-sanctum--sync-header-line)))
+
+(defun herdr-sanctum--on-terminal-size-change (window-or-frame)
+  "Refresh `*sanctum*' header-line when shown or when its width changes."
+  (when herdr-sanctum-header-line-enable
+    (let ((buf (if (and (windowp window-or-frame)
+                        (window-live-p window-or-frame))
+                   (window-buffer window-or-frame)
+                 (current-buffer))))
+      (when (and (buffer-live-p buf)
+                 (eq buf (get-buffer herdr-sanctum-buffer-name)))
+        (with-current-buffer buf
+          (let ((win (if (windowp window-or-frame)
+                         window-or-frame
+                       (herdr-sanctum-panel-window buf))))
+            (when (window-live-p win)
+              (let ((width (window-body-width win (display-graphic-p (window-frame win)))))
+                (when (or herdr-sanctum--header-line-dirty
+                          (null herdr-sanctum--header-line-string)
+                          (not (equal width (window-parameter win 'herdr-sanctum-header-width))))
+                  (herdr-sanctum--refresh-header-line win))))))))))
 
 (defun herdr-sanctum-header-line ()
-  "Format `*sanctum*' top chrome bar with exact pixel right-alignment."
+  "Return `*sanctum*' top chrome bar or active terminal mode banner."
   (or (herdr-sanctum-terminal-mode-banner (current-buffer))
-      (let* ((left (herdr-sanctum-header-line-left))
-             (right (herdr-sanctum-header-line-right))
-             (win (or (get-buffer-window (current-buffer)) (selected-window))))
-        (if (and (display-graphic-p)
-                 (window-live-p win)
-                 (fboundp 'string-pixel-width))
-            (let* ((body-px (window-body-width win t))
-                   (right-px (string-pixel-width right (current-buffer)))
-                   (align-px (max 0 (- body-px right-px 6))))
-              (concat left
-                      (propertize " "
-                                  'display `(space :align-to (,align-px))
-                                  'face 'herdr-sanctum-chrome-bar)
-                      right))
-          (concat left "  " right)))))
+      (if (and herdr-sanctum--header-line-string
+               (not herdr-sanctum--header-line-dirty))
+          herdr-sanctum--header-line-string
+        (herdr-sanctum--refresh-header-line))))
 
-(defconst herdr-sanctum-header-line-format
-  '(:eval (herdr-sanctum-header-line))
-  "Top-level `header-line-format' for `*sanctum*'.")
+(add-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum--sync-header-line)
+(add-hook 'herdr-sanctum-git-update-hook #'herdr-sanctum--on-git-header-line)
+(add-hook 'herdr-sanctum-theme-change-hook #'herdr-sanctum--sync-header-line)
+(add-hook 'herdr-sanctum-drawer-change-hook #'herdr-sanctum--sync-header-line)
 
 ;;; Fuzzy Jump
 
@@ -380,51 +457,65 @@ or when Herdr has only a single pane."
                      ws-id)))))
     (nreverse entries)))
 
+(defun herdr-sanctum--fetch-jump-snapshot ()
+  "Return a Herdr snapshot for `herdr-sanctum-jump' without leaking timers."
+  (or (herdr-sanctum-snapshot)
+      (let ((sock (herdr-sanctum-socket-path)))
+        (unless (file-exists-p sock)
+          (user-error "Herdr socket unavailable: %s" sock))
+        (let ((herdr-sanctum-rpc-timeout 0.6)
+              (done nil)
+              (snap nil)
+              (proc nil))
+          (unwind-protect
+              (progn
+                (setq proc
+                      (herdr-sanctum-rpc-call
+                       "session.snapshot" nil
+                       (lambda (result err)
+                         (setq done t)
+                         (unless err
+                           (setq snap (alist-get 'snapshot result))
+                           (when (and snap
+                                      (or (herdr-sanctum-any-ui-buffer-live-p)
+                                          (herdr-sanctum-connected-p)))
+                             (herdr-sanctum-apply-snapshot snap))))
+                       t))
+                (let ((deadline (+ (float-time) 0.6)))
+                  (while (and (not done) (< (float-time) deadline))
+                    (accept-process-output nil 0.02)))
+                snap)
+            (when (and (not done) (processp proc))
+              (when-let* ((timer (process-get proc 'herdr-sanctum-rpc-timer)))
+                (when (timerp timer)
+                  (cancel-timer timer))
+                (process-put proc 'herdr-sanctum-rpc-timer nil))
+              (when (process-live-p proc)
+                (delete-process proc))))))))
+
 ;;;###autoload
 (defun herdr-sanctum-jump ()
   "Fuzzy-jump to any Herdr attention agent, space, or tab."
   (interactive)
-  (unless (herdr-sanctum-snapshot)
-    (herdr-sanctum-request-snapshot t)
-    (let ((deadline (+ (float-time) 0.6)))
-      (while (and (< (float-time) deadline) (null (herdr-sanctum-snapshot)))
-        (accept-process-output nil 0.02))))
-  (unless (herdr-sanctum-snapshot)
-    (user-error "Herdr snapshot unavailable"))
-  (let* ((candidates (herdr-sanctum--jump-candidates (herdr-sanctum-snapshot)))
-         (table (lambda (string pred action)
-                  (if (eq action 'metadata)
-                      '(metadata (category . herdr-sanctum-target)
-                                 (display-sort-function . identity)
-                                 (cycle-sort-function . identity))
-                    (complete-with-action action candidates string pred))))
-         (choice (completing-read "Sanctum jump: " table nil t))
-         (target (cdr (assoc choice candidates))))
-    (when target
-      (if (member (buffer-name (window-buffer)) (herdr-sanctum-ui-buffers))
-          (herdr-sanctum-focus-terminal)
-        (herdr-sanctum '(4)))
-      (herdr-sanctum-sidebar-focus-item target nil))))
+  (let ((snap (herdr-sanctum--fetch-jump-snapshot)))
+    (unless snap
+      (user-error "Herdr snapshot unavailable"))
+    (let* ((candidates (herdr-sanctum--jump-candidates snap))
+           (table (lambda (string pred action)
+                    (if (eq action 'metadata)
+                        '(metadata (category . herdr-sanctum-target)
+                                   (display-sort-function . identity)
+                                   (cycle-sort-function . identity))
+                      (complete-with-action action candidates string pred))))
+           (choice (completing-read "Sanctum jump: " table nil t))
+           (target (cdr (assoc choice candidates))))
+      (when target
+        (if (get-buffer-window herdr-sanctum-buffer-name (selected-frame))
+            (herdr-sanctum-focus-terminal)
+          (herdr-sanctum '(4)))
+        (herdr-sanctum-sidebar-focus-item target nil)))))
 
 ;;; Entry Point & Host Container
-
-(defun herdr-sanctum--ensure-tab (name)
-  "Select `tab-bar' tab NAME, creating it if it does not exist."
-  (unless tab-bar-mode
-    (tab-bar-mode 1))
-  (if (seq-some (lambda (tab) (equal (alist-get 'name tab) name))
-                (tab-bar-tabs))
-      (tab-bar-select-tab-by-name name)
-    (tab-bar-new-tab)
-    (tab-bar-rename-tab name)))
-
-(defun herdr-sanctum--ensure-frame (name)
-  "Select or create a dedicated frame named NAME."
-  (let ((existing (seq-find (lambda (f) (equal (frame-parameter f 'name) name))
-                            (frame-list))))
-    (if (frame-live-p existing)
-        (select-frame-set-input-focus existing)
-      (select-frame-set-input-focus (make-frame `((name . ,name)))))))
 
 (defun herdr-sanctum--prepare-host ()
   "Prepare the host frame/tab according to `herdr-sanctum-display-mode'."
@@ -432,23 +523,38 @@ or when Herdr has only a single pane."
    ((functionp herdr-sanctum-display-mode)
     (funcall herdr-sanctum-display-mode))
    ((eq herdr-sanctum-display-mode 'tab)
-    (herdr-sanctum--ensure-tab herdr-sanctum-tab-name))
+    (unless tab-bar-mode
+      (tab-bar-mode 1))
+    (if (seq-some (lambda (tab) (equal (alist-get 'name tab) herdr-sanctum-tab-name))
+                  (tab-bar-tabs))
+        (tab-bar-select-tab-by-name herdr-sanctum-tab-name)
+      (tab-bar-new-tab)
+      (tab-bar-rename-tab herdr-sanctum-tab-name)))
    ((eq herdr-sanctum-display-mode 'frame)
-    (herdr-sanctum--ensure-frame herdr-sanctum-frame-name))
+    (let ((existing (seq-find (lambda (f)
+                                (equal (frame-parameter f 'name)
+                                       herdr-sanctum-frame-name))
+                              (frame-list))))
+      (if (frame-live-p existing)
+          (select-frame-set-input-focus existing)
+        (select-frame-set-input-focus
+         (make-frame `((name . ,herdr-sanctum-frame-name)))))))
    ((eq herdr-sanctum-display-mode 'current)
     nil)
    (t
     (user-error "Invalid `herdr-sanctum-display-mode': %S"
                 herdr-sanctum-display-mode))))
 
-;;;###autoload
 (defun herdr-sanctum-default-toggle-back ()
   "Switch to the previous `tab-bar' tab when in `tab' display mode."
   (when (and (eq herdr-sanctum-display-mode 'tab)
-             (> (length (tab-bar-tabs)) 1))
+             (> (length (tab-bar-tabs)) 1)
+             (equal (alist-get 'name (tab-bar--current-tab))
+                    herdr-sanctum-tab-name))
     (tab-bar-switch-to-recent-tab)
     t))
 
+;;;###autoload
 (defun herdr-sanctum (&optional arg)
   "Open the Sanctum workbench, or toggle back when already inside it.
 With prefix ARG, always focus `*sanctum*' without toggling back."
@@ -458,41 +564,68 @@ With prefix ARG, always focus `*sanctum*' without toggling back."
                (member (buffer-name) (herdr-sanctum-ui-buffers))
                (functionp herdr-sanctum-toggle-back-function)
                (funcall herdr-sanctum-toggle-back-function))
-    (herdr-sanctum--prepare-host)
-    (let* ((default-directory (expand-file-name "~/"))
-           (buffer (get-buffer-create herdr-sanctum-buffer-name)))
-      (switch-to-buffer buffer)
-      (delete-other-windows)
-      (herdr-sanctum-terminal-start buffer)
-      (with-current-buffer buffer
-        (let ((remaps `((header-line (:inherit herdr-sanctum-chrome-bar) header-line)
-                        (header-line-active (:inherit herdr-sanctum-chrome-bar) header-line-active))))
-          (when herdr-sanctum-terminal-font-height
-            (push (if (facep 'ghostel-default)
-                      `(default (:height ,herdr-sanctum-terminal-font-height)
-                                ghostel-default default)
-                    `(default (:height ,herdr-sanctum-terminal-font-height) default))
-                  remaps))
-          (setq-local line-spacing herdr-sanctum-terminal-line-spacing
-                      mode-line-format nil
-                      header-line-format (when herdr-sanctum-header-line-enable
-                                           herdr-sanctum-header-line-format)
-                      left-fringe-width 0
-                      right-fringe-width 0
-                      right-margin-width 0
-                      face-remapping-alist remaps))
-        (add-hook 'kill-buffer-hook #'herdr-sanctum-disconnect nil t))
-      (let ((term-win (selected-window)))
-        (set-window-fringes term-win 0 0)
-        (set-window-margins term-win 0 0)
-        (when (herdr-sanctum-sidebar-enabled-p)
-          (herdr-sanctum-sidebar-show))
-        (when (herdr-sanctum-drawer-enabled-p)
-          (herdr-sanctum-drawer-show))
-        (select-window term-win)
-        (herdr-sanctum-terminal-resize term-win)
-        (set-window-dedicated-p term-win t))
-      (herdr-sanctum-ensure-connected))))
+    (let* ((existing-buf (get-buffer herdr-sanctum-buffer-name))
+           (resolved (herdr-sanctum-terminal-validate-start existing-buf)))
+      (herdr-sanctum--prepare-host)
+      (let ((visible-win (and existing-buf
+                              (herdr-sanctum-terminal-live-p existing-buf)
+                              (get-buffer-window existing-buf (selected-frame)))))
+        (if (and (window-live-p visible-win)
+                 (or (not (herdr-sanctum-sidebar-enabled-p))
+                     (herdr-sanctum-sidebar-visible-p))
+                 (or (not (herdr-sanctum-drawer-enabled-p))
+                     (herdr-sanctum-drawer-visible-p)))
+            (progn
+              (select-window visible-win)
+              (when (and herdr-sanctum-header-line-enable
+                         (or (null (buffer-local-value 'herdr-sanctum--header-line-string existing-buf))
+                             (buffer-local-value 'herdr-sanctum--header-line-dirty existing-buf)))
+                (herdr-sanctum--refresh-header-line visible-win))
+              (herdr-sanctum-ensure-connected))
+          (let* ((init-dir (or (herdr-sanctum-focused-dir) (expand-file-name "~/")))
+                 (default-directory init-dir)
+                 (saved-wconf (current-window-configuration))
+                 (created-buf (null existing-buf))
+                 (buffer (or existing-buf (get-buffer-create herdr-sanctum-buffer-name))))
+            (with-current-buffer buffer
+              (setq-local default-directory init-dir))
+            (condition-case err
+                (progn
+                  (switch-to-buffer buffer)
+                  (delete-other-windows)
+                  (herdr-sanctum-terminal-start buffer resolved))
+              (error
+               (set-window-configuration saved-wconf)
+               (when (and created-buf (buffer-live-p buffer))
+                 (kill-buffer buffer))
+               (signal (car err) (cdr err))))
+            (with-current-buffer buffer
+              (herdr-sanctum-apply-terminal-header-remapping buffer)
+              (setq-local mode-line-format nil
+                          header-line-format
+                          (when herdr-sanctum-header-line-enable
+                            '(:eval (or (herdr-sanctum-terminal-mode-banner)
+                                        herdr-sanctum--header-line-string)))
+                          left-fringe-width 0
+                          right-fringe-width 0
+                          left-margin-width 0
+                          right-margin-width 0)
+              (add-hook 'kill-buffer-hook #'herdr-sanctum-disconnect nil t)
+              (add-hook 'window-size-change-functions
+                        #'herdr-sanctum--on-terminal-size-change nil t))
+            (let ((term-win (selected-window)))
+              (set-window-fringes term-win 0 0)
+              (set-window-margins term-win 0 0)
+              (when (herdr-sanctum-sidebar-enabled-p)
+                (herdr-sanctum-sidebar-show))
+              (when (herdr-sanctum-drawer-enabled-p)
+                (herdr-sanctum-drawer-show))
+              (select-window term-win)
+              (herdr-sanctum-terminal-resize term-win)
+              (set-window-dedicated-p term-win t)
+              (when herdr-sanctum-header-line-enable
+                (herdr-sanctum--refresh-header-line term-win)))
+            (herdr-sanctum-ensure-connected)))))))
 
 ;;; Cross-Boundary Navigation & DWIM Window/Pane Commands
 
@@ -514,10 +647,13 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
        "pane.focus_direction"
        `((direction . ,(symbol-name direction)))
        (lambda (result err)
-         (when (or err (not (alist-get 'changed result)))
-           (when (window-live-p origin)
-             (with-selected-window origin
-               (herdr-sanctum--windmove direction)))))))))
+         (cond
+          ((and (not err) (alist-get 'changed result))
+           (herdr-sanctum-schedule-snapshot))
+          ((and (window-live-p origin)
+                (eq (selected-window) origin))
+           (herdr-sanctum--windmove direction))))
+       t))))
 
 ;;;###autoload
 (defun herdr-sanctum-nav-left ()
@@ -560,15 +696,36 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
     (select-window (split-window-below))))
 
 (defun herdr-sanctum-default-maximize-window ()
-  "Toggle maximizing the current Emacs window."
+  "Toggle maximizing the current non-side Emacs window."
   (interactive)
-  (if (and (= (count-windows) 1)
-           herdr-sanctum--saved-window-config)
-      (let ((cfg herdr-sanctum--saved-window-config))
-        (setq herdr-sanctum--saved-window-config nil)
-        (set-window-configuration cfg))
-    (setq herdr-sanctum--saved-window-config (current-window-configuration))
-    (delete-other-windows)))
+  (let* ((tab (and (bound-and-true-p tab-bar-mode)
+                   (tab-bar--current-tab-find)))
+         (saved (if tab
+                    (alist-get 'herdr-sanctum-saved-window-config (cdr tab))
+                  (frame-parameter nil 'herdr-sanctum-saved-window-config)))
+         (valid-saved (and (window-configuration-p saved)
+                           (eq (window-configuration-frame saved) (selected-frame))
+                           saved))
+         (non-side-count
+          (seq-count (lambda (w) (not (window-parameter w 'window-side)))
+                     (window-list nil 'no-minibuf))))
+    (when (and saved (not valid-saved))
+      (if tab
+          (setf (alist-get 'herdr-sanctum-saved-window-config (cdr tab) nil t) nil)
+        (set-frame-parameter nil 'herdr-sanctum-saved-window-config nil)))
+    (if (and (= non-side-count 1) valid-saved)
+        (progn
+          (if tab
+              (setf (alist-get 'herdr-sanctum-saved-window-config (cdr tab) nil t) nil)
+            (set-frame-parameter nil 'herdr-sanctum-saved-window-config nil))
+          (set-window-configuration valid-saved))
+      (when (and (> non-side-count 1)
+                 (not (window-parameter nil 'window-side)))
+        (let ((wconf (current-window-configuration)))
+          (if tab
+              (setf (alist-get 'herdr-sanctum-saved-window-config (cdr tab)) wconf)
+            (set-frame-parameter nil 'herdr-sanctum-saved-window-config wconf)))
+        (delete-other-windows)))))
 
 ;;;###autoload
 (defun herdr-sanctum-zoom-or-maximize ()
@@ -581,10 +738,13 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
        "pane.zoom"
        '((mode . "toggle"))
        (lambda (result err)
-         (when (or err (not (alist-get 'changed result)))
-           (when (window-live-p origin)
-             (with-selected-window origin
-               (ignore-errors (funcall herdr-sanctum-maximize-window-function))))))))))
+         (cond
+          ((and (not err) (alist-get 'changed result))
+           (herdr-sanctum-schedule-snapshot))
+          ((and (window-live-p origin)
+                (eq (selected-window) origin))
+           (ignore-errors (funcall herdr-sanctum-maximize-window-function)))))
+       t))))
 
 (defun herdr-sanctum-tab-step (delta)
   "Step DELTA tabs in active Herdr space when in `*sanctum*', else Emacs."
@@ -593,7 +753,7 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
     (let* ((snap (herdr-sanctum-snapshot))
            (ws-id (alist-get 'focused_workspace_id snap))
            (cur-tab (alist-get 'focused_tab_id snap))
-           (ws-tabs (cl-remove-if-not
+           (ws-tabs (seq-filter
                      (lambda (tab) (equal (alist-get 'workspace_id tab) ws-id))
                      (alist-get 'tabs snap)))
            (count (length ws-tabs)))
@@ -604,9 +764,9 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
        ((<= count 1)
         (message "Single tab in current Herdr space"))
        (t
-        (let* ((idx (or (cl-position cur-tab ws-tabs
-                                     :key (lambda (tab) (alist-get 'tab_id tab))
-                                     :test #'equal)
+        (let* ((idx (or (seq-position ws-tabs cur-tab
+                                      (lambda (tab id)
+                                        (equal (alist-get 'tab_id tab) id)))
                         0))
                (target (nth (mod (+ idx delta) count) ws-tabs))
                (target-id (alist-get 'tab_id target)))
@@ -641,16 +801,16 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
       (message "No active Herdr agents"))
      (t
       (let* ((focused (alist-get 'focused_pane_id snap))
-             (idx (cl-position focused agents
-                               :key (lambda (a) (alist-get 'pane_id a))
-                               :test #'equal))
+             (idx (seq-position agents focused
+                                (lambda (a id)
+                                  (equal (alist-get 'pane_id a) id))))
              (target (if idx
                          (nth (mod (+ idx delta) count) agents)
                        (if (> delta 0) (car agents) (car (last agents)))))
              (pane-id (alist-get 'pane_id target)))
         (when pane-id
           (herdr-sanctum-rpc-call "pane.focus" `((pane_id . ,pane-id)))
-          (if (get-buffer herdr-sanctum-buffer-name)
+          (if (get-buffer-window herdr-sanctum-buffer-name (selected-frame))
               (herdr-sanctum-focus-terminal)
             (herdr-sanctum '(4)))))))))
 
@@ -672,7 +832,7 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
   (interactive)
   (cond
    ((herdr-sanctum-in-sanctum-p)
-    (herdr-sanctum-rpc-call "tab.create" '((focus . t))))
+    (herdr-sanctum--create-focused-tab))
    ((functionp herdr-sanctum-new-tab-fallback-function)
     (call-interactively herdr-sanctum-new-tab-fallback-function))
    (t
@@ -689,25 +849,34 @@ at the Herdr edge.  Elsewhere, moves between Emacs windows."
           (when (y-or-n-p (format "Close Herdr pane (%s)? "
                                   (herdr-sanctum-focused-pane-label)))
             (herdr-sanctum-rpc-call "pane.close" `((pane_id . ,pane-id))))
-        (herdr-sanctum-rpc-call
-         "pane.current" nil
-         (lambda (result err)
-           (let ((id (and (not err) (alist-get 'pane_id result))))
-             (if (not id)
-                 (message "No focused Herdr pane to close")
-               (when (y-or-n-p (format "Close Herdr pane (%s)? " id))
-                 (herdr-sanctum-rpc-call "pane.close" `((pane_id . ,id)))))))))))
-   ((not (one-window-p t))
+        (let ((origin (selected-window)))
+          (herdr-sanctum-rpc-call
+           "pane.current" nil
+           (lambda (result err)
+             (let ((id (and (not err) (alist-get 'pane_id result))))
+               (if (not id)
+                   (message "No focused Herdr pane to close")
+                 (run-at-time
+                  0 nil
+                  (lambda ()
+                    (when (and (window-live-p origin)
+                               (eq (selected-window) origin)
+                               (y-or-n-p (format "Close Herdr pane (%s)? " id)))
+                      (herdr-sanctum-rpc-call "pane.close" `((pane_id . ,id)))))))))
+           t)))))
+   ((eq (window-deletable-p) t)
     (delete-window))
    (t
     (kill-current-buffer))))
 
 ;;; Prefix Keymap (Opt-in, Zero Global Pollution)
 
+;;;###autoload
 (defvar-keymap herdr-sanctum-command-map
   :doc "Prefix keymap for `herdr-sanctum' commands.
 Bind it to a prefix of your choice, e.g.:
   (keymap-global-set \"C-c s\" herdr-sanctum-command-map)"
+  :prefix 'herdr-sanctum-command-map
   "s" #'herdr-sanctum
   "b" #'herdr-sanctum-sidebar-toggle
   "d" #'herdr-sanctum-drawer-toggle
@@ -716,7 +885,6 @@ Bind it to a prefix of your choice, e.g.:
   "p" #'herdr-sanctum-prev-agent
   "t" #'herdr-sanctum-new-tab-dwim
   "g" #'herdr-sanctum-refresh-state
-  "I" #'herdr-sanctum-toggle-agent-icon-style
   "?" #'herdr-sanctum-doctor)
 
 ;;; Diagnostics
@@ -728,7 +896,7 @@ Bind it to a prefix of your choice, e.g.:
   (let* ((prog (executable-find herdr-sanctum-program))
          (sock (herdr-sanctum-socket-path))
          (sock-ok (file-exists-p sock))
-         (backend (ignore-errors (herdr-sanctum--resolve-terminal-backend)))
+         (backend (herdr-sanctum-terminal-resolve-backend t))
          (avail-fn (plist-get backend :available-p))
          (backend-ok (and backend (or (null avail-fn) (funcall avail-fn))))
          (svg-ok (herdr-sanctum-svg-available-p))
@@ -749,7 +917,7 @@ Bind it to a prefix of your choice, e.g.:
         (insert (format "  inline SVG       : %s\n" (if svg-ok "supported" "TTY/text fallback")))
         (insert (format "  agent SVG dir    : %s (%s)\n"
                         (or herdr-sanctum-agent-icon-directory "nil")
-                        (if icons-ok "found" "fallback to builtin SVGs")))
+                        (if icons-ok "found" "fallback to SVG monograms")))
         (insert (format "  display mode     : %S\n" herdr-sanctum-display-mode))
         (insert (format "  drawer views     : %S\n\n"
                         (mapcar #'car (herdr-sanctum-drawer-active-views))))

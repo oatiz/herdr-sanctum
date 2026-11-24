@@ -30,31 +30,33 @@
 
 ;;; Code:
 
-(require 'cl-lib)
-(require 'seq)
+(require 'face-remap)
 (require 'subr-x)
-(require 'herdr-sanctum-rpc)
-(require 'herdr-sanctum-theme)
+
+(defvar herdr-sanctum-buffer-name "*sanctum*")
 
 (declare-function ghostel-exec "ghostel" (buffer program &rest args))
 (declare-function ghostel--adjust-size "ghostel" (window &optional force))
-(declare-function ghostel-window-size "ghostel" ())
 (defvar ghostel--input-mode)
 (defvar ghostel--process)
-(defvar ghostel--term-cols)
 (defvar ghostel-buffer-name-function)
 (defvar ghostel-detect-password-prompts)
 (defvar ghostel-window-padding-balance)
 
+(defgroup herdr-sanctum-terminal nil
+  "Terminal emulator backend settings for `herdr-sanctum'."
+  :group 'herdr-sanctum
+  :prefix "herdr-sanctum-")
+
 (defcustom herdr-sanctum-program "herdr"
   "Executable name or path of the Herdr TUI binary."
   :type 'string
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-terminal)
 
 (defcustom herdr-sanctum-program-args nil
   "Optional extra command-line arguments passed to `herdr-sanctum-program'."
   :type '(repeat string)
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-terminal)
 
 (defcustom herdr-sanctum-terminal-backend 'ghostel
   "Terminal emulator backend used to host `herdr' inside `*sanctum*'.
@@ -68,31 +70,52 @@ or a backend plist directly with keys:
   `:available-p'  -- `()' optional check used by `herdr-sanctum-doctor'."
   :type '(choice (symbol :tag "Registered backend")
                  (plist :tag "Custom backend plist"))
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-terminal)
 
 (defcustom herdr-sanctum-terminal-line-spacing 0.12
   "Buffer-local `line-spacing' used in the `*sanctum*' terminal buffer."
   :type '(choice (const :tag "Default" nil) number)
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-terminal)
 
-(defcustom herdr-sanctum-open-outside-function nil
-  "Function `(FN DIR)' used when opening files or Git views from Sanctum.
-When nil, simply call FN with `default-directory' bound to DIR.
-Set this to switch tabs or frames before opening code, Magit, or diffs."
-  :type '(choice (const :tag "Default (current context)" nil)
-                 (function :tag "Custom dispatcher"))
-  :group 'herdr-sanctum)
-
-(defcustom herdr-sanctum-ghostel-inhibit-transient-resize nil
-  "When non-nil, advise `ghostel--adjust-size' to skip row-only resizes while
-a minibuffer, which-key, or transient popup is visible over `*sanctum*'.
-Disabled by default so Sanctum does not patch Ghostel internals unless opted in."
-  :type 'boolean
-  :group 'herdr-sanctum
+(defcustom herdr-sanctum-terminal-font-height nil
+  "Optional `:height' remapping applied to `*sanctum*' terminal body text.
+When nil, keep the active terminal mode's default height."
+  :type '(choice (const :tag "Default" nil)
+                 (integer :tag "Absolute 1/10pt")
+                 (float :tag "Relative scale"))
+  :group 'herdr-sanctum-terminal
   :set (lambda (sym val)
          (set-default sym val)
-         (when (fboundp 'herdr-sanctum-ghostel--sync-resize-guard)
-           (herdr-sanctum-ghostel--sync-resize-guard))))
+         (when (and (featurep 'herdr-sanctum-terminal)
+                    (fboundp 'herdr-sanctum-terminal--apply-font-height))
+           (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
+             (herdr-sanctum-terminal--apply-font-height buf)
+             (when (and (fboundp 'herdr-sanctum-terminal-live-p)
+                        (fboundp 'herdr-sanctum-terminal-resize)
+                        (herdr-sanctum-terminal-live-p buf))
+               (herdr-sanctum-terminal-resize))))))
+
+(defvar herdr-sanctum-terminal-start-hook nil
+  "Hook run inside `*sanctum*' after `herdr-sanctum-terminal-start' finishes.")
+
+(defvar-local herdr-sanctum-terminal--font-cookie nil
+  "Face-remapping cookie for `herdr-sanctum-terminal-font-height'.")
+
+(defun herdr-sanctum-terminal--apply-font-height (buffer)
+  "Synchronize `default' font-height remapping in terminal BUFFER.
+Uses `face-remap-add-relative' and `face-remap-remove-relative' with
+`herdr-sanctum-terminal--font-cookie' so pre-existing `default' remappings
+(such as `ghostel-default', `buffer-face-mode', or `text-scale-mode') are
+preserved when `herdr-sanctum-terminal-font-height' is nil or reset."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when herdr-sanctum-terminal--font-cookie
+        (face-remap-remove-relative herdr-sanctum-terminal--font-cookie)
+        (setq herdr-sanctum-terminal--font-cookie nil))
+      (when herdr-sanctum-terminal-font-height
+        (setq herdr-sanctum-terminal--font-cookie
+              (face-remap-add-relative 'default
+                                       :height herdr-sanctum-terminal-font-height))))))
 
 (defvar herdr-sanctum-terminal-backends nil
   "Alist of `(NAME . PLIST)' registered Sanctum terminal backends.")
@@ -111,58 +134,105 @@ SPEC keys:
   (setf (alist-get name herdr-sanctum-terminal-backends) spec)
   name)
 
-(defun herdr-sanctum--resolve-terminal-backend ()
-  "Return the active terminal backend plist or signal a `user-error'."
-  (cond
-   ((and (listp herdr-sanctum-terminal-backend)
-         (keywordp (car herdr-sanctum-terminal-backend)))
-    herdr-sanctum-terminal-backend)
-   ((symbolp herdr-sanctum-terminal-backend)
-    (or (alist-get herdr-sanctum-terminal-backend herdr-sanctum-terminal-backends)
-        (user-error "Unknown Sanctum terminal backend: %s"
-                    herdr-sanctum-terminal-backend)))
-   (t
-    (user-error "Invalid `herdr-sanctum-terminal-backend': %S"
-                herdr-sanctum-terminal-backend))))
+(defun herdr-sanctum-terminal-resolve-backend (&optional noerror)
+  "Return the active terminal backend plist.
+Validates that the backend provides `:start' and `:live-p' functions.
+Signal a `user-error' on invalid configuration unless NOERROR is non-nil."
+  (let ((backend
+         (cond
+          ((and (listp herdr-sanctum-terminal-backend)
+                (keywordp (car-safe herdr-sanctum-terminal-backend)))
+           herdr-sanctum-terminal-backend)
+          ((symbolp herdr-sanctum-terminal-backend)
+           (or (alist-get herdr-sanctum-terminal-backend
+                          herdr-sanctum-terminal-backends)
+               (unless noerror
+                 (user-error "Unknown Sanctum terminal backend: %s"
+                             herdr-sanctum-terminal-backend))))
+          ((not noerror)
+           (user-error "Invalid `herdr-sanctum-terminal-backend': %S"
+                       herdr-sanctum-terminal-backend)))))
+    (when backend
+      (if (and (proper-list-p backend)
+               (functionp (plist-get backend :start))
+               (functionp (plist-get backend :live-p)))
+          backend
+        (unless noerror
+          (user-error
+           "Sanctum terminal backend %S requires `:start' and `:live-p' functions"
+           herdr-sanctum-terminal-backend))))))
 
 (defun herdr-sanctum-terminal-live-p (&optional buffer)
   "Return non-nil when BUFFER (default `*sanctum*') has a live terminal process."
-  (when-let* ((buf (or buffer (get-buffer herdr-sanctum-buffer-name))))
-    (when (buffer-live-p buf)
-      (let ((live-fn (plist-get (herdr-sanctum--resolve-terminal-backend) :live-p)))
-        (and (functionp live-fn) (funcall live-fn buf))))))
+  (when-let* ((buf (or buffer (get-buffer herdr-sanctum-buffer-name)))
+              ((buffer-live-p buf))
+              (backend (herdr-sanctum-terminal-resolve-backend t))
+              (live-fn (plist-get backend :live-p)))
+    (and (functionp live-fn) (funcall live-fn buf))))
 
 (defun herdr-sanctum-in-sanctum-p ()
   "Return non-nil when the selected buffer is the live `*sanctum*' terminal."
   (and (equal (buffer-name) herdr-sanctum-buffer-name)
        (herdr-sanctum-terminal-live-p (current-buffer))))
 
-(defun herdr-sanctum-terminal-start (buffer)
-  "Ensure `herdr-sanctum-program' is running inside BUFFER via the active backend."
-  (let* ((backend (herdr-sanctum--resolve-terminal-backend))
-         (start-fn (plist-get backend :start))
-         (setup-fn (plist-get backend :setup))
-         (program (or (executable-find herdr-sanctum-program)
-                      (user-error "Cannot find %s in exec-path"
-                                  herdr-sanctum-program))))
-    (unless (herdr-sanctum-terminal-live-p buffer)
+(defun herdr-sanctum-terminal-validate-start (&optional buffer)
+  "Validate backend and executable before mutating layout for BUFFER.
+Return `(BACKEND . PROGRAM)' where PROGRAM is nil when BUFFER already has a
+live terminal process."
+  (let* ((backend (herdr-sanctum-terminal-resolve-backend))
+         (live-fn (plist-get backend :live-p))
+         (live (and buffer (buffer-live-p buffer)
+                    (functionp live-fn)
+                    (funcall live-fn buffer)))
+         (program nil))
+    (unless live
+      (let ((avail-fn (plist-get backend :available-p)))
+        (when (and (functionp avail-fn) (not (funcall avail-fn)))
+          (user-error "Sanctum terminal backend `%s' is unavailable"
+                      herdr-sanctum-terminal-backend)))
+      (setq program (or (executable-find herdr-sanctum-program)
+                        (user-error "Cannot find %s in exec-path"
+                                    herdr-sanctum-program))))
+    (cons backend program)))
+
+(defun herdr-sanctum-terminal-start (buffer &optional resolved)
+  "Ensure `herdr-sanctum-program' is running inside BUFFER via the active backend.
+Optional RESOLVED is a `(BACKEND . PROGRAM)' cons returned by
+`herdr-sanctum-terminal-validate-start' to avoid redundant resolution."
+  (pcase-let* ((`(,backend . ,program)
+                (or resolved (herdr-sanctum-terminal-validate-start buffer)))
+               (start-fn (plist-get backend :start))
+               (live-fn (plist-get backend :live-p))
+               (setup-fn (plist-get backend :setup)))
+    (when (and program
+               (not (and (functionp live-fn) (funcall live-fn buffer))))
       (funcall start-fn buffer program herdr-sanctum-program-args))
     (when (functionp setup-fn)
       (funcall setup-fn buffer))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq-local line-spacing herdr-sanctum-terminal-line-spacing)
+        (herdr-sanctum-terminal--apply-font-height buffer)
+        (run-hooks 'herdr-sanctum-terminal-start-hook)))
     buffer))
 
 (defun herdr-sanctum-terminal-resize (&optional window)
   "Notify the active terminal backend to sync PTY dimensions for WINDOW."
   (when-let* ((win (or window
-                       (get-buffer-window herdr-sanctum-buffer-name (selected-frame)))))
-    (when (window-live-p win)
-      (when-let* ((resize-fn (plist-get (herdr-sanctum--resolve-terminal-backend) :resize)))
-        (funcall resize-fn win)))))
+                       (get-buffer-window herdr-sanctum-buffer-name (selected-frame))))
+              ((window-live-p win))
+              (backend (herdr-sanctum-terminal-resolve-backend t))
+              (resize-fn (plist-get backend :resize))
+              ((functionp resize-fn)))
+    (funcall resize-fn win)))
 
 (defun herdr-sanctum-terminal-mode-banner (&optional buffer)
-  "Return an optional header-line mode banner for BUFFER from the active backend."
+  "Return an optional header-line mode banner for BUFFER from the active backend.
+Returns nil gracefully when the terminal backend is invalid or unconfigured."
   (when-let* ((buf (or buffer (current-buffer)))
-              (banner-fn (plist-get (herdr-sanctum--resolve-terminal-backend) :mode-banner)))
+              (backend (herdr-sanctum-terminal-resolve-backend t))
+              (banner-fn (plist-get backend :mode-banner))
+              ((functionp banner-fn)))
     (funcall banner-fn buf)))
 
 ;;;###autoload
@@ -172,23 +242,13 @@ SPEC keys:
   (when-let* ((win (get-buffer-window herdr-sanctum-buffer-name (selected-frame))))
     (select-window win)))
 
-(defun herdr-sanctum-open-outside (fn &optional dir)
-  "Run FN in DIR (default focused Herdr directory), respecting outside routing."
-  (let ((target-dir (or dir (herdr-sanctum-focused-dir) default-directory)))
-    (if (functionp herdr-sanctum-open-outside-function)
-        (funcall herdr-sanctum-open-outside-function fn target-dir)
-      (let ((default-directory target-dir))
-        (funcall fn)))))
-
 ;;; Built-in Ghostel Backend
 
 (defun herdr-sanctum-ghostel--start (buffer program args)
   "Start PROGRAM with ARGS in BUFFER using `ghostel'."
   (unless (require 'ghostel nil t)
     (user-error "The `ghostel' package is required for the ghostel terminal backend"))
-  (if args
-      (apply #'ghostel-exec buffer program args)
-    (ghostel-exec buffer program)))
+  (apply #'ghostel-exec buffer program args))
 
 (defun herdr-sanctum-ghostel--live-p (buffer)
   "Return non-nil when BUFFER is a live `ghostel-mode' terminal."
@@ -209,52 +269,29 @@ SPEC keys:
   (when (fboundp 'ghostel--adjust-size)
     (ghostel--adjust-size window t)))
 
+(defconst herdr-sanctum-ghostel--banner-copy
+  (propertize " COPY  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
+              'face 'herdr-sanctum-banner-info)
+  "Pre-allocated header-line banner for Ghostel `copy' input mode.")
+
+(defconst herdr-sanctum-ghostel--banner-emacs
+  (propertize " EMACS (live)  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
+              'face 'herdr-sanctum-banner-info)
+  "Pre-allocated header-line banner for Ghostel `emacs' input mode.")
+
+(defconst herdr-sanctum-ghostel--banner-char
+  (propertize " CHAR (raw keys)  M-RET exit "
+              'face 'herdr-sanctum-banner-warn)
+  "Pre-allocated header-line banner for Ghostel `char' input mode.")
+
 (defun herdr-sanctum-ghostel--mode-banner (buffer)
   "Return a header-line banner for non-semi-char Ghostel modes in BUFFER."
   (with-current-buffer buffer
     (pcase (bound-and-true-p ghostel--input-mode)
-      ('copy
-       (propertize " COPY  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
-                   'face 'herdr-sanctum-banner-info))
-      ('emacs
-       (propertize " EMACS (live)  h/j/k/l · w/x/y copy · / search · RET link · q/i exit "
-                   'face 'herdr-sanctum-banner-info))
-      ('char
-       (propertize " CHAR (raw keys)  M-RET exit "
-                   'face 'herdr-sanctum-banner-warn))
+      ('copy herdr-sanctum-ghostel--banner-copy)
+      ('emacs herdr-sanctum-ghostel--banner-emacs)
+      ('char herdr-sanctum-ghostel--banner-char)
       (_ nil))))
-
-(defun herdr-sanctum-ghostel--transient-popup-visible-p (frame)
-  "Return non-nil when FRAME shows a minibuffer, which-key, or transient popup."
-  (or (and (active-minibuffer-window)
-           (eq (window-frame (active-minibuffer-window)) frame))
-      (seq-some (lambda (name)
-                  (when-let* ((buf (get-buffer name)))
-                    (get-buffer-window buf frame)))
-                '(" *which-key*" " *transient*"))))
-
-(defun herdr-sanctum-ghostel--inhibit-minibuffer-resize (orig-fn window &optional force)
-  "Skip row-only resizes of `*sanctum*' while a transient bottom popup is open."
-  (if (and (not force)
-           (window-live-p window)
-           (equal (buffer-name (window-buffer window)) herdr-sanctum-buffer-name)
-           (herdr-sanctum-ghostel--transient-popup-visible-p (window-frame window))
-           (with-current-buffer (window-buffer window)
-             (when-let* ((size (and (fboundp 'ghostel-window-size)
-                                    (ghostel-window-size))))
-               (eql (car size) (bound-and-true-p ghostel--term-cols)))))
-      nil
-    (funcall orig-fn window force)))
-
-(defun herdr-sanctum-ghostel--sync-resize-guard ()
-  "Install or remove Ghostel's transient-popup resize guard."
-  (if herdr-sanctum-ghostel-inhibit-transient-resize
-      (with-eval-after-load 'ghostel
-        (advice-add 'ghostel--adjust-size :around
-                    #'herdr-sanctum-ghostel--inhibit-minibuffer-resize))
-    (when (fboundp 'ghostel--adjust-size)
-      (advice-remove 'ghostel--adjust-size
-                     #'herdr-sanctum-ghostel--inhibit-minibuffer-resize))))
 
 (herdr-sanctum-register-terminal-backend
  'ghostel
@@ -264,8 +301,6 @@ SPEC keys:
  :resize #'herdr-sanctum-ghostel--resize
  :mode-banner #'herdr-sanctum-ghostel--mode-banner
  :available-p (lambda () (or (featurep 'ghostel) (locate-library "ghostel"))))
-
-(herdr-sanctum-ghostel--sync-resize-guard)
 
 (provide 'herdr-sanctum-terminal)
 ;;; herdr-sanctum-terminal.el ends here

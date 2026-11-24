@@ -34,28 +34,31 @@
 (require 'subr-x)
 (require 'herdr-sanctum-rpc)
 
+(defgroup herdr-sanctum-ime nil
+  "Per-pane input method synchronization for `herdr-sanctum'."
+  :group 'herdr-sanctum
+  :prefix "herdr-sanctum-ime-")
+
 (defcustom herdr-sanctum-ime-input-method nil
   "Input method name managed per Herdr pane.
 When nil, use `default-input-method' (for example \"rime\")."
   :type '(choice (const :tag "Use default-input-method" nil)
                  (string :tag "Input method name"))
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-ime)
 
 (defcustom herdr-sanctum-ime-agent-default t
   "When non-nil, enable the input method by default on Herdr agent panes."
   :type 'boolean
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-ime)
 
 (defcustom herdr-sanctum-ime-shell-default nil
   "When non-nil, enable the input method by default on Herdr shell panes."
   :type 'boolean
-  :group 'herdr-sanctum)
+  :group 'herdr-sanctum-ime)
 
-(defvar herdr-sanctum-ime--pane-states (make-hash-table :test #'equal)
-  "Map `pane_id' -> `on' or `off' for manual IME toggles in `*sanctum*'.")
-
-(defvar herdr-sanctum-ime--pane-kinds (make-hash-table :test #'equal)
-  "Map `pane_id' -> `agent' or `shell' tracked from Herdr snapshots and events.")
+(defvar herdr-sanctum-ime--panes (make-hash-table :test #'equal)
+  "Map `pane_id' -> `(KIND . PREF)' tracked for `*sanctum*' IME sync.
+KIND is `agent', `shell', or nil; PREF is `on', `off', or nil.")
 
 (defvar herdr-sanctum-ime--focused-pane-id nil
   "Herdr `pane_id' currently mirrored by `*sanctum*' input method state.")
@@ -75,77 +78,92 @@ When nil, use `default-input-method' (for example \"rime\")."
          (not (string-empty-p method))
          (assoc method input-method-alist))))
 
-(defun herdr-sanctum-ime--record-activate ()
-  "Remember manual IME activation for the focused Herdr pane."
+(defun herdr-sanctum-ime--record-pref (pref)
+  "Remember manual IME PREF (`on' or `off') for the focused Herdr pane."
   (when (and (not herdr-sanctum-ime--syncing)
              herdr-sanctum-ime--focused-pane-id
              (equal (buffer-name) herdr-sanctum-buffer-name)
              (equal current-input-method (herdr-sanctum-ime--method)))
-    (puthash herdr-sanctum-ime--focused-pane-id 'on herdr-sanctum-ime--pane-states)))
+    (let* ((pane-id herdr-sanctum-ime--focused-pane-id)
+           (entry (gethash pane-id herdr-sanctum-ime--panes)))
+      (puthash pane-id (cons (car entry) pref) herdr-sanctum-ime--panes))))
+
+(defun herdr-sanctum-ime--record-activate ()
+  "Remember manual IME activation for the focused Herdr pane."
+  (herdr-sanctum-ime--record-pref 'on))
 
 (defun herdr-sanctum-ime--record-deactivate ()
   "Remember manual IME deactivation for the focused Herdr pane."
-  (when (and (not herdr-sanctum-ime--syncing)
-             herdr-sanctum-ime--focused-pane-id
-             (equal (buffer-name) herdr-sanctum-buffer-name)
-             (equal current-input-method (herdr-sanctum-ime--method)))
-    (puthash herdr-sanctum-ime--focused-pane-id 'off herdr-sanctum-ime--pane-states)))
+  (herdr-sanctum-ime--record-pref 'off))
 
-(defun herdr-sanctum-ime--update-pane-kind (pane-id is-agent)
-  "Record whether PANE-ID is an `agent' or `shell' pane.
+(defun herdr-sanctum-ime--pane-kind (pane)
+  "Return `agent' when PANE identifies an agent, otherwise `shell'.
+Checks `agent' first and falls back to `display_agent' when empty."
+  (let ((agent (alist-get 'agent pane))
+        (display-agent (alist-get 'display_agent pane)))
+    (if (or (and (stringp agent) (not (string-empty-p agent)))
+            (and (stringp display-agent) (not (string-empty-p display-agent))))
+        'agent
+      'shell)))
+
+(defun herdr-sanctum-ime--update-pane-kind (pane-id kind)
+  "Record KIND (`agent' or `shell') for PANE-ID.
 Clear any manual override when the pane transitions between shell and agent."
   (when (stringp pane-id)
-    (let ((kind (if is-agent 'agent 'shell))
-          (prev (gethash pane-id herdr-sanctum-ime--pane-kinds)))
-      (when (and prev (not (eq prev kind)))
-        (remhash pane-id herdr-sanctum-ime--pane-states))
-      (puthash pane-id kind herdr-sanctum-ime--pane-kinds))))
+    (let* ((entry (gethash pane-id herdr-sanctum-ime--panes))
+           (prev-kind (car entry))
+           (pref (if (and prev-kind (not (eq prev-kind kind)))
+                     nil
+                   (cdr entry))))
+      (puthash pane-id (cons kind pref) herdr-sanctum-ime--panes))))
 
 (defun herdr-sanctum-ime-sync-pane (pane-id)
   "Sync `*sanctum*' input method to PANE-ID's remembered or default preference."
-  (when (stringp pane-id)
+  (if (not (stringp pane-id))
+      (setq herdr-sanctum-ime--focused-pane-id nil)
     (setq herdr-sanctum-ime--focused-pane-id pane-id)
-    (when (herdr-sanctum-ime--available-p)
-      (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
-        (let* ((method (herdr-sanctum-ime--method))
-               (pref (gethash pane-id herdr-sanctum-ime--pane-states))
-               (is-agent (eq (gethash pane-id herdr-sanctum-ime--pane-kinds) 'agent))
-               (want-on (if pref
-                            (eq pref 'on)
-                          (if is-agent
-                              herdr-sanctum-ime-agent-default
-                            herdr-sanctum-ime-shell-default))))
-          (with-current-buffer buf
-            (let ((is-on (equal current-input-method method)))
-              (unless (eq want-on is-on)
-                (condition-case err
-                    (let ((herdr-sanctum-ime--syncing t))
-                      (if want-on
-                          (activate-input-method method)
-                        (deactivate-input-method)))
-                  (error
-                   (message "Sanctum IME sync failed: %s" (error-message-string err))))
-                (force-mode-line-update t)))))))))
+    (when-let* ((buf (get-buffer herdr-sanctum-buffer-name)))
+      (with-current-buffer buf
+        (when (herdr-sanctum-ime--available-p)
+          (let* ((method (herdr-sanctum-ime--method))
+                 (entry (gethash pane-id herdr-sanctum-ime--panes))
+                 (is-agent (eq (car entry) 'agent))
+                 (pref (cdr entry))
+                 (want-on (if pref
+                              (eq pref 'on)
+                            (if is-agent
+                                herdr-sanctum-ime-agent-default
+                              herdr-sanctum-ime-shell-default)))
+                 (is-on (equal current-input-method method)))
+            (when (and herdr-sanctum-ime-input-method
+                       (not (equal default-input-method method)))
+              (setq-local default-input-method method))
+            (unless (eq want-on is-on)
+              (condition-case err
+                  (let ((herdr-sanctum-ime--syncing t))
+                    (if want-on
+                        (activate-input-method method)
+                      (deactivate-input-method)))
+                (error
+                 (message "Sanctum IME sync failed: %s" (error-message-string err))))
+              (force-mode-line-update))))))))
 
 (defun herdr-sanctum-ime--on-snapshot (snapshot)
   "Reconcile tracked pane kinds from SNAPSHOT, prune closed panes, and sync focus."
   (let ((panes (alist-get 'panes snapshot))
-        (live (make-hash-table :test #'equal)))
+        (live (make-hash-table :test #'equal))
+        stale)
     (dolist (pane panes)
       (when-let* ((pane-id (alist-get 'pane_id pane)))
         (puthash pane-id t live)
-        (let ((agent (or (alist-get 'agent pane)
-                         (alist-get 'display_agent pane))))
-          (herdr-sanctum-ime--update-pane-kind
-           pane-id (and (stringp agent) (not (string-empty-p agent)))))))
-    (dolist (tbl (list herdr-sanctum-ime--pane-kinds herdr-sanctum-ime--pane-states))
-      (let (stale)
-        (maphash (lambda (pane-id _v)
-                   (unless (gethash pane-id live)
-                     (push pane-id stale)))
-                 tbl)
-        (dolist (pane-id stale)
-          (remhash pane-id tbl))))
+        (herdr-sanctum-ime--update-pane-kind
+         pane-id (herdr-sanctum-ime--pane-kind pane))))
+    (maphash (lambda (pane-id _v)
+               (unless (gethash pane-id live)
+                 (push pane-id stale)))
+             herdr-sanctum-ime--panes)
+    (dolist (pane-id stale)
+      (remhash pane-id herdr-sanctum-ime--panes))
     (herdr-sanctum-ime-sync-pane (alist-get 'focused_pane_id snapshot))))
 
 (defun herdr-sanctum-ime--on-event (kind data)
@@ -157,36 +175,43 @@ Clear any manual override when the pane transitions between shell and agent."
     ("pane_created"
      (when-let* ((pane (alist-get 'pane data))
                  (pane-id (alist-get 'pane_id pane)))
-       (let ((agent (or (alist-get 'agent pane)
-                        (alist-get 'display_agent pane))))
-         (herdr-sanctum-ime--update-pane-kind
-          pane-id (and (stringp agent) (not (string-empty-p agent)))))))
+       (herdr-sanctum-ime--update-pane-kind
+        pane-id (herdr-sanctum-ime--pane-kind pane))))
     ("pane_agent_detected"
      (when-let* ((pane-id (alist-get 'pane_id data)))
        (let* ((agent (alist-get 'agent data))
               (released (alist-get 'released data))
-              (is-agent (and (stringp agent)
+              (kind (if (and (stringp agent)
                              (not (string-empty-p agent))
-                             (not released))))
-         (herdr-sanctum-ime--update-pane-kind pane-id is-agent)
+                             (not released))
+                        'agent
+                      'shell)))
+         (herdr-sanctum-ime--update-pane-kind pane-id kind)
          (when (equal pane-id herdr-sanctum-ime--focused-pane-id)
            (herdr-sanctum-ime-sync-pane pane-id)))))
     ((or "pane_closed" "pane_exited")
      (when-let* ((pane-id (alist-get 'pane_id data)))
-       (remhash pane-id herdr-sanctum-ime--pane-states)
-       (remhash pane-id herdr-sanctum-ime--pane-kinds)))))
+       (remhash pane-id herdr-sanctum-ime--panes)
+       (when (equal pane-id herdr-sanctum-ime--focused-pane-id)
+         (setq herdr-sanctum-ime--focused-pane-id nil))))))
+
+(defun herdr-sanctum-ime--on-terminal-start ()
+  "Sync input method into `*sanctum*' after terminal startup or restart."
+  (if herdr-sanctum-ime--focused-pane-id
+      (herdr-sanctum-ime-sync-pane herdr-sanctum-ime--focused-pane-id)
+    (when-let* ((snap (herdr-sanctum-snapshot)))
+      (herdr-sanctum-ime--on-snapshot snap))))
 
 (defun herdr-sanctum-ime--clear ()
   "Reset tracked per-pane IME state."
-  (clrhash herdr-sanctum-ime--pane-states)
-  (clrhash herdr-sanctum-ime--pane-kinds)
+  (clrhash herdr-sanctum-ime--panes)
   (setq herdr-sanctum-ime--focused-pane-id nil))
 
 ;;;###autoload
 (define-minor-mode herdr-sanctum-ime-mode
   "Toggle automatic per-pane input method synchronization in `*sanctum*'."
   :global t
-  :group 'herdr-sanctum
+  :group 'herdr-sanctum-ime
   (if herdr-sanctum-ime-mode
       (progn
         (add-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
@@ -194,6 +219,7 @@ Clear any manual override when the pane transitions between shell and agent."
         (add-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
         (add-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
         (add-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
+        (add-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
         (when-let* ((snap (herdr-sanctum-snapshot)))
           (herdr-sanctum-ime--on-snapshot snap)))
     (remove-hook 'input-method-activate-hook #'herdr-sanctum-ime--record-activate)
@@ -201,6 +227,7 @@ Clear any manual override when the pane transitions between shell and agent."
     (remove-hook 'herdr-sanctum-event-hook #'herdr-sanctum-ime--on-event)
     (remove-hook 'herdr-sanctum-snapshot-hook #'herdr-sanctum-ime--on-snapshot)
     (remove-hook 'herdr-sanctum-disconnect-hook #'herdr-sanctum-ime--clear)
+    (remove-hook 'herdr-sanctum-terminal-start-hook #'herdr-sanctum-ime--on-terminal-start)
     (herdr-sanctum-ime--clear)))
 
 (provide 'herdr-sanctum-ime)
